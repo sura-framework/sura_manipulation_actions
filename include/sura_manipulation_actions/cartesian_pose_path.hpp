@@ -6,8 +6,10 @@
 #include <cmath>
 #include <cstddef>
 #include <string>
+#include <vector>
 
 #include "nav_msgs/msg/path.hpp"
+#include "sura_manipulation_actions/msg/cartesian_pose_sample.hpp"
 #include "sura_manipulation_actions/msg/cartesian_pose_trajectory.hpp"
 
 namespace sura_manipulation_actions
@@ -29,6 +31,8 @@ public:
   {
     waypoint_count_ = 0;
     duration_ = 0.0;
+    times_.clear();
+    poses_.clear();
     start_.setIdentity();
     target_.setIdentity();
     start_orientation_.setIdentity();
@@ -147,11 +151,51 @@ public:
       ((start_.translation() - target_.translation()).norm() > 1e-12 || angle > 1e-12))
     {error = "A moving Cartesian profile needs a positive duration"; return false;}
     duration_ = input.duration; waypoint_count_ = duration_ == 0.0 ? 1U : 2U;
+    times_.clear(); poses_.clear();
     error.clear(); return true;
+  }
+
+  // Sampled mode: poses at strictly increasing times, the first at zero. Position is
+  // interpolated linearly and orientation by shortest-arc SLERP between neighbours.
+  bool initSamples(const std::vector<msg::CartesianPoseSample> & input, std::string & error)
+  {
+    waypoint_count_ = 0;
+    duration_ = 0.0;
+    times_.clear();
+    poses_.clear();
+    if (input.size() < 2) {
+      error = "Sampled Cartesian trajectory needs at least two samples";
+      return false;
+    }
+    for (std::size_t i = 0; i < input.size(); ++i) {
+      const auto & p = input[i].pose;
+      Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+      pose.translation() << p.position.x, p.position.y, p.position.z;
+      const Eigen::Quaterniond orientation(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
+      const double time = input[i].time_from_start;
+      if (!std::isfinite(time) || !pose.translation().allFinite() || !orientation.coeffs().allFinite() ||
+        std::abs(orientation.norm() - 1.0) > 1e-6)
+      {
+        error = "Sampled Cartesian trajectory contains an invalid pose or time";
+        return false;
+      }
+      if (i == 0 ? std::abs(time) > 1e-12 : time <= times_.back()) {
+        error = "Sample times must start at zero and strictly increase";
+        return false;
+      }
+      pose.linear() = orientation.normalized().toRotationMatrix();
+      times_.push_back(time);
+      poses_.push_back(pose);
+    }
+    duration_ = times_.back();
+    waypoint_count_ = input.size();
+    error.clear();
+    return true;
   }
 
   Eigen::Isometry3d sample(double elapsed) const
   {
+    if (!times_.empty()) {return sampledPose(elapsed);}
     if (duration_ == 0.0 || elapsed >= duration_) {return target_;}
     if (!std::isfinite(elapsed) || elapsed <= 0.0) {return start_;}
     const double u = elapsed / duration_;
@@ -163,6 +207,7 @@ public:
   // expressed in the same reference frame as sample().
   Velocity sampleVelocity(double elapsed) const
   {
+    if (!times_.empty()) {return sampledVelocity(elapsed);}
     Velocity velocity = Velocity::Zero();
     if (duration_ == 0.0 || !std::isfinite(elapsed) || elapsed <= 0.0 || elapsed >= duration_) {
       return velocity;
@@ -221,8 +266,49 @@ private:
     return result;
   }
 
+  // Index of the segment [b-1, b] containing elapsed, clamped to a valid segment.
+  std::size_t segmentEnd(double elapsed) const
+  {
+    const auto it = std::upper_bound(times_.begin(), times_.end(), elapsed);
+    const auto index = static_cast<std::size_t>(it - times_.begin());
+    return std::min(std::max<std::size_t>(index, 1U), times_.size() - 1U);
+  }
+
+  Eigen::Isometry3d sampledPose(double elapsed) const
+  {
+    if (!std::isfinite(elapsed) || elapsed <= times_.front()) {return poses_.front();}
+    if (elapsed >= times_.back()) {return poses_.back();}
+    const std::size_t b = segmentEnd(elapsed);
+    const std::size_t a = b - 1U;
+    const double progress = (elapsed - times_[a]) / (times_[b] - times_[a]);
+    Eigen::Quaterniond begin(poses_[a].rotation()), end(poses_[b].rotation());
+    if (begin.dot(end) < 0.0) {end.coeffs() *= -1.0;}
+    Eigen::Isometry3d result = Eigen::Isometry3d::Identity();
+    result.translation() = (1.0 - progress) * poses_[a].translation() + progress * poses_[b].translation();
+    result.linear() = begin.slerp(progress, end).normalized().toRotationMatrix();
+    return result;
+  }
+
+  // Segment slope: linear velocity of the translation and spatial angular velocity.
+  Velocity sampledVelocity(double elapsed) const
+  {
+    Velocity velocity = Velocity::Zero();
+    if (!std::isfinite(elapsed) || elapsed < times_.front() || elapsed >= times_.back()) {return velocity;}
+    const std::size_t b = segmentEnd(elapsed);
+    const std::size_t a = b - 1U;
+    const double dt = times_[b] - times_[a];
+    velocity.head<3>() = (poses_[b].translation() - poses_[a].translation()) / dt;
+    Eigen::Quaterniond begin(poses_[a].rotation()), end(poses_[b].rotation());
+    if (begin.dot(end) < 0.0) {end.coeffs() *= -1.0;}
+    const Eigen::AngleAxisd rotation(end * begin.conjugate());
+    velocity.tail<3>() = rotation.axis() * rotation.angle() / dt;
+    return velocity;
+  }
+
   Eigen::Isometry3d start_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d target_ = Eigen::Isometry3d::Identity();
+  std::vector<double> times_;
+  std::vector<Eigen::Isometry3d> poses_;
   Eigen::Quaterniond start_orientation_ = Eigen::Quaterniond::Identity();
   Eigen::Quaterniond target_orientation_ = Eigen::Quaterniond::Identity();
   Eigen::Vector3d angular_displacement_ = Eigen::Vector3d::Zero();

@@ -1,0 +1,9 @@
+# One whole-body nominal reference for the Task Priority robot_nominal task.
+# The pose and twist describe the base origin in header.frame_id (the controller world
+# frame). base_twist.angular is the spatial angular velocity in world axes.
+std_msgs/Header header
+geometry_msgs/Pose base_pose
+geometry_msgs/Twist base_twist
+string[] joint_names
+float64[] positions
+float64[] velocities

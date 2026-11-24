@@ -1,0 +1,8 @@
+uint64 preparation_id
+RobotConfiguration configuration
+bool baseline_feasible
+float64 baseline_cost
+float64 cost
+float64 minimum_joint_margin
+float64 minimum_clearance
+float64 peak_tilt

@@ -1,0 +1,32 @@
+uint8 PLAN=0
+uint8 APPLY=1
+uint8 operation
+uint64 preparation_id
+CartesianPoseTrajectory trajectory
+string task_id
+string tip_frame
+geometry_msgs/Quaternion tolerance_orientation
+float64[6] path_tolerance
+float64[6] goal_tolerance
+float64 goal_time_tolerance
+# Frozen MoveIt scene, in the planning frame. APPLY provides a fresh scene.
+moveit_msgs/PlanningScene scene
+string robot_description
+string robot_description_semantic
+# Whole-body nominal trajectory (base + both arms) for robot_nominal. PLAN optimizes the
+# initial posture as its first knot (no separate posture search); APPLY repositions,
+# then replans the nominal from the settled state.
+bool full_trajectory false
+---
+bool success
+string message
+PosturePreparationSummary proposal
+# Filled only with full_trajectory. Both share time_from_start and use the controller
+# world frame; the joint trajectory contains both arms in controller order.
+trajectory_msgs/JointTrajectory nominal_joints
+trajectory_msgs/MultiDOFJointTrajectory nominal_base
+string nominal_method
+float64 nominal_cost
+---
+string stage
+uint32 evaluations

@@ -37,18 +37,23 @@ find_package(visualization_msgs REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/CartesianPoseSample.msg"
   "msg/CartesianPoseTrajectory.msg"
   "action/CheckCartesianTrajectory.action"
+  "msg/RobotConfiguration.msg"
+  "msg/PosturePreparationSummary.msg"
+  "action/PrepareCartesianPosture.action"
   "msg/BaseMotionLimits.msg"
   "msg/TrajectoryTrackingTolerances.msg"
   "msg/PlanningTargetState.msg"
+  "msg/RobotNominalReference.msg"
   "srv/UpdatePlanningTarget.srv"
   "action/FollowCartesianTrajectory.action"
   "action/PlanJointTrajectory.action"
   "action/PlanBimanualJointTrajectory.action"
   "action/PlanBimanualCartesianTrajectory.action"
   "action/PlanCartesianTrajectory.action"
-  DEPENDENCIES builtin_interfaces trajectory_msgs geometry_msgs nav_msgs std_msgs
+  DEPENDENCIES builtin_interfaces trajectory_msgs geometry_msgs nav_msgs std_msgs moveit_msgs
 )
 
 rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
@@ -263,5 +268,7 @@ if(BUILD_TESTING)
 endif()
 
 ament_export_include_directories(include)
-ament_export_dependencies(rosidl_default_runtime builtin_interfaces Eigen3 geometry_msgs nav_msgs std_msgs trajectory_msgs)
+ament_export_dependencies(
+  rosidl_default_runtime builtin_interfaces Eigen3 osqp_vendor osqp moveit_msgs
+  geometry_msgs nav_msgs std_msgs trajectory_msgs)
 ament_package()

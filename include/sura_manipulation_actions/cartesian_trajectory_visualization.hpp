@@ -40,6 +40,11 @@ public:
     const bimanual_cartesian::PlannedTrajectory & plan,
     const bimanual_cartesian::Arm & arm);
   CartesianViews publishPosePath(const nav_msgs::msg::Path & desired);
+  // Publish a whole-body nominal of the Pose backend (base path and both arms) and
+  // add its base path to `views` and the refreshed path cache.
+  void publishPoseNominal(
+    const trajectory_msgs::msg::JointTrajectory & joints,
+    const trajectory_msgs::msg::MultiDOFJointTrajectory & base, CartesianViews & views);
 
 private:
   struct PathCache

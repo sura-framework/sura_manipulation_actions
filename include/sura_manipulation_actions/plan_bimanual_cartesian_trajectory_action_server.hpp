@@ -8,10 +8,15 @@
 #include <thread>
 
 #include "controller_manager_msgs/srv/list_controllers.hpp"
+#include "geometry_msgs/msg/pose_stamped.hpp"
+#include "geometry_msgs/msg/twist_stamped.hpp"
+#include "rcl_interfaces/srv/set_parameters_atomically.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "std_srvs/srv/trigger.hpp"
+#include "sura_manipulation_actions/action/check_cartesian_trajectory.hpp"
 #include "sura_manipulation_actions/action/plan_bimanual_cartesian_trajectory.hpp"
+#include "sura_manipulation_actions/msg/cartesian_pose_sample.hpp"
 #include "sura_manipulation_actions/bimanual_cartesian_planner.hpp"
 #include "sura_manipulation_actions/cartesian_moveit_context.hpp"
 #include "sura_manipulation_actions/cartesian_trajectory_visualization.hpp"
@@ -32,6 +37,16 @@ public:
 
 private:
   enum class Stage {Idle, Planning, Pending, Executing};
+  // Pose backend: one task-priority pose endpoint per arm (left_pose / right_pose).
+  struct PoseEndpoint
+  {
+    std::string arm_name, controller_node, task_id, target_topic, feedforward_topic;
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr target;
+    rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr feedforward;
+    rclcpp::Client<rcl_interfaces::srv::SetParametersAtomically>::SharedPtr setter;
+    std::string check_action;
+    rclcpp_action::Client<sura_manipulation_actions::action::CheckCartesianTrajectory>::SharedPtr checker;
+  };
   struct PendingPlan
   {
     std::shared_ptr<Handle> handle;
@@ -39,6 +54,8 @@ private:
     bimanual_cartesian::Pair pair;
     bimanual_cartesian::GoalSpec goal;
     bimanual_cartesian::Options options;
+    std::string backend;  // controller, task or pose; resolved per goal
+    bool use_stpik{true};
     bimanual_cartesian::PlannedTrajectory plan;
     CartesianViews views;
     Eigen::Isometry3d fixed_from_model = Eigen::Isometry3d::Identity();
@@ -58,6 +75,12 @@ private:
   void handleAccepted(const std::shared_ptr<Handle> & handle);
   void planGoal(const std::shared_ptr<PendingPlan> & pending);
   void executePlan(const std::shared_ptr<PendingPlan> & pending);
+  void executePosePlan(const std::shared_ptr<PendingPlan> & pending);
+  bool setAutoUpdate(PoseEndpoint & endpoint, bool enabled, std::string & error);
+  bool checkPoseSamples(
+    const std::shared_ptr<PendingPlan> & pending, PoseEndpoint & endpoint,
+    std::vector<sura_manipulation_actions::msg::CartesianPoseSample> samples,
+    bool & retryable, std::string & error);
   bool backendReady(const PendingPlan & pending, std::string & error);
   bool validatePending(const PendingPlan & pending, std::string & error) const;
   void executeTrigger(
@@ -80,10 +103,16 @@ private:
   double state_timeout_{2.0}, state_max_age_{2.0}, planning_time_{5.0}, cartesian_step_{0.005};
   double start_joint_tolerance_{0.001}, start_prismatic_tolerance_{0.0001};
   double base_position_tolerance_{0.005}, base_orientation_tolerance_{0.01};
+  // STPIK tracking tolerances, same parameter names as the single-arm planner.
+  std::vector<double> tip_path_tolerance_{0.02, 0.02, 0.02, 0.3, 0.3, 0.3};
+  std::vector<double> tip_goal_tolerance_{0.02, 0.02, 0.02, 0.3, 0.3, 0.3};
+  double goal_time_tolerance_{0.5};
+  double stpik_timeout_{35.0};
   bimanual_cartesian::Options planner_options_;
   ExecutionOptions execution_options_;
   std::map<std::string, bimanual_cartesian::Arm> arms_;
   std::map<std::string, bimanual_cartesian::Pair> pairs_;
+  std::map<std::string, PoseEndpoint> pose_endpoints_;
   std::unique_ptr<CartesianMoveItContext> context_;
   std::unique_ptr<CartesianTrajectoryVisualization> visualization_;
   std::unique_ptr<TrajectoryExecutor> executor_;

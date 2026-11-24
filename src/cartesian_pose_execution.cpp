@@ -1,4 +1,5 @@
 #include "sura_manipulation_actions/plan_cartesian_trajectory_action_server.hpp"
+#include "sura_manipulation_actions/cartesian_tracking.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -19,6 +20,61 @@ namespace
 using GetParameters = rcl_interfaces::srv::GetParameters;
 using SetParameters = rcl_interfaces::srv::SetParametersAtomically;
 using PoseError = Eigen::Matrix<double, 6, 1>;
+
+template<class ActionT, class Deadline>
+bool controllerRequest(const typename rclcpp_action::Client<ActionT>::SharedPtr & client,
+  const typename ActionT::Goal & goal, const Deadline & deadline, const std::function<bool()> & canceled,
+  typename rclcpp_action::ClientGoalHandle<ActionT>::WrappedResult & wrapped, std::string & error)
+{
+  // Handle late acceptance too, including cancellation while send_goal is in flight.
+  struct Dispatch {std::mutex mutex; bool canceled = false; typename rclcpp_action::ClientGoalHandle<ActionT>::SharedPtr handle;};
+  auto dispatch = std::make_shared<Dispatch>();
+  typename rclcpp_action::Client<ActionT>::SendGoalOptions options;
+  options.goal_response_callback = [dispatch, client](typename rclcpp_action::ClientGoalHandle<ActionT>::SharedPtr handle) {
+      bool cancel = false;
+      {std::scoped_lock lock(dispatch->mutex); dispatch->handle = handle; cancel = dispatch->canceled;}
+      if (cancel && handle) {try {client->async_cancel_goal(handle);} catch (const std::exception &) {}}
+    };
+  const auto cancel_check = [&]() {
+      typename rclcpp_action::ClientGoalHandle<ActionT>::SharedPtr handle;
+      {std::scoped_lock lock(dispatch->mutex); dispatch->canceled = true; handle = dispatch->handle;}
+      if (handle) {try {client->async_cancel_goal(handle);} catch (const std::exception &) {}}
+    };
+  try {
+    auto accepted = client->async_send_goal(goal, options);
+    while (accepted.wait_for(std::chrono::milliseconds(10)) != std::future_status::ready) {
+      if (canceled() || std::chrono::steady_clock::now() >= deadline) {
+        cancel_check(); error = "Controller action request canceled or timed out; feasibility unknown"; return false;
+      }
+    }
+    const auto handle = accepted.get();
+    if (!handle) {error = "Controller action request rejected: controller may be busy"; return false;}
+    auto result = client->async_get_result(handle);
+    while (result.wait_for(std::chrono::milliseconds(10)) != std::future_status::ready) {
+      if (canceled() || std::chrono::steady_clock::now() >= deadline) {
+        cancel_check(); error = "Controller action canceled or timed out; feasibility unknown"; return false;
+      }
+    }
+    wrapped = result.get();
+    return true;
+  } catch (const std::exception & e) {
+    cancel_check(); error = e.what(); return false;
+  }
+}
+
+template<class Goal, class Plan>
+void setTrackingGoal(Goal & goal, const Plan & pending, const std::string & frame, const std::string & task_id)
+{
+  goal.trajectory = pending.pose_path.descriptor(frame);
+  goal.task_id = task_id;
+  goal.tip_frame = pending.arm.tip_frame;
+  const Eigen::Quaterniond tolerance(pending.goal.world_from_tolerance.rotation());
+  goal.tolerance_orientation.x = tolerance.x(); goal.tolerance_orientation.y = tolerance.y();
+  goal.tolerance_orientation.z = tolerance.z(); goal.tolerance_orientation.w = tolerance.w();
+  std::copy_n(pending.tracking_tolerances.tip_path.begin(), 6, goal.path_tolerance.begin());
+  std::copy_n(pending.tracking_tolerances.tip_goal.begin(), 6, goal.goal_tolerance.begin());
+  goal.goal_time_tolerance = rclcpp::Duration(pending.tracking_tolerances.goal_time_tolerance).seconds();
+}
 
 template<class Service>
 typename Service::Response::SharedPtr request(
@@ -58,8 +114,10 @@ bool setAutoUpdate(
     if (!response) {return false;}
     if (response->result.successful) {return true;}
     error = response->result.reason;
-    // The standalone host can briefly reject parameters while updating tasks.
-    if (error.find("retry the parameter change") == std::string::npos) {return false;}
+    // Both hosts can briefly reject parameters while updating tasks.
+    const bool busy = error.find("retry the parameter change") != std::string::npos ||
+      error.find("retry the parameter update") != std::string::npos;
+    if (!busy) {return false;}
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   } while (std::chrono::steady_clock::now() < deadline);
   return false;
@@ -93,13 +151,9 @@ geometry_msgs::msg::PoseStamped poseMessage(
 
 PoseError poseError(
   const Eigen::Isometry3d & desired, const Eigen::Isometry3d & measured,
-  const Eigen::Matrix3d & reference)
+  const Eigen::Matrix3d & reference, const PoseError & activation = PoseError::Ones())
 {
-  PoseError result;
-  result.head<3>() = reference.transpose() * (desired.translation() - measured.translation());
-  const Eigen::AngleAxisd difference(desired.rotation() * measured.rotation().transpose());
-  result.tail<3>() = reference.transpose() * difference.axis() * difference.angle();
-  return result;
+  return cartesianTrackingError(desired, measured, reference, activation);
 }
 
 bool within(const PoseError & error, const std::vector<double> & tolerance)
@@ -165,6 +219,11 @@ void PlanCartesianTrajectoryActionServer::planPoseGoal(const std::shared_ptr<Pen
     desired.header.stamp = now();
     for (auto & point : desired.poses) {point.header.stamp = desired.header.stamp;}
     pending->views = visualization_->publishPosePath(desired);
+    if ((pending->handle->get_goal()->optimize_initial_posture || pending->wants_nominal) &&
+      !preparePosture(*pending, false, error))
+    {
+      finish(pending, false, error); return;
+    }
     retain(pending, pending->handle->get_goal()->use_stpik ?
       "Geometric tool path published; STPIK validation will run when execution is requested" :
       "Geometric tool path published; use_stpik=false; waiting for Pose execution");
@@ -184,14 +243,15 @@ bool PlanCartesianTrajectoryActionServer::validatePosePending(const PendingPlan 
 {
   Eigen::Isometry3d measured;
   if (!readTipPose(pending, measured, error)) {return false;}
-  if (!within(poseError(pending.pose_start, measured, pending.goal.world_from_tolerance.rotation()),
+  if (!within(poseError(pending.pose_start, measured, pending.goal.world_from_tolerance.rotation(),
+      pending.pose_activation),
       pending.tracking_tolerances.tip_path))
   {error = "Plan obsolete: tool moved since planning; send a new goal"; return false;}
   return true;
 }
 
 bool PlanCartesianTrajectoryActionServer::poseBackendReady(
-  const PendingPlan & pending, bool & auto_update, std::string & error)
+  PendingPlan & pending, bool & auto_update, std::string & error)
 {
   if (!backendReady(pending, error)) {return false;}
   const auto & endpoint = pose_endpoints_.at(pending.arm.name);
@@ -215,9 +275,92 @@ bool PlanCartesianTrajectoryActionServer::poseBackendReady(
     values[2].string_value != "task_priority_kinematic_control/EndEffectorPoseTask")
   {error = "Selected task must be FramePoseTask or EndEffectorPoseTask"; return false;}
   auto_update = values[3].bool_value;
+  pending.pose_activation.setOnes();
+  if (values[2].string_value == "task_priority_kinematic_control/FramePoseTask") {
+    auto mask_request = std::make_shared<GetParameters::Request>();
+    mask_request->names = {prefix + "activation"};
+    const auto mask_response = request<GetParameters>(client, mask_request,
+      execution_options_.controller_wait_timeout, error,
+      [this, &pending]() {return stopped_.load() || pending.handle->is_canceling() || !execution_active_.load();});
+    if (!mask_response) {return false;}
+    if (mask_response->values.size() != 1 ||
+      mask_response->values[0].type != Type::PARAMETER_INTEGER_ARRAY)
+    {error = "Frame pose activation must be an integer array"; return false;}
+    const auto & mask = mask_response->values[0].integer_array_value;
+    if (!mask.empty() && mask.size() != 6)
+    {error = "Frame pose activation must contain six values or be empty"; return false;}
+    for (size_t i = 0; i < mask.size(); ++i) {
+      if (mask[i] != 0 && mask[i] != 1)
+      {error = "Frame pose activation values must be 0 or 1"; return false;}
+      pending.pose_activation(i) = mask[i];
+    }
+    if (pending.pose_activation.isZero())
+    {error = "Frame pose task has no active axes"; return false;}
+  }
   if (endpoint.target->get_subscription_count() == 0 || endpoint.feedforward->get_subscription_count() == 0) {
     error = "Pose target/feedforward subscribers are unavailable; check controller namespace and task ID"; return false;
   }
+  if (pending.wants_nominal && (!endpoint.nominal || endpoint.nominal->get_subscription_count() == 0)) {
+    error = "robot_nominal reference subscriber is unavailable on " + endpoint.nominal_topic +
+      "; configure a RobotNominalTask in the controller"; return false;
+  }
+  return true;
+}
+
+bool PlanCartesianTrajectoryActionServer::preparePosture(PendingPlan & pending, bool apply, std::string & error)
+{
+  const auto & endpoint = pose_endpoints_.at(pending.arm.name);
+  const auto canceled = [&]() {
+    return !rclcpp::ok() || stopped_.load() || pending.handle->is_canceling() ||
+           !pending.handle->is_active() || (apply && !execution_active_.load());
+  };
+  if (!endpoint.preparer->wait_for_action_server(std::chrono::seconds(2)) || canceled()) {
+    error = "Posture action unavailable: " + endpoint.prepare_action; return false;
+  }
+  feedback(pending.handle, apply ? 0.8F : 0.4F, apply ? "applying_posture" : "optimizing_posture",
+    apply ? "Rechecking and applying the proposed configuration" :
+    pending.wants_nominal ? "Optimizing the initial posture and the whole-body nominal trajectory" :
+    "Evaluating initial postures over the Cartesian path");
+  PrepareAction::Goal goal;
+  setTrackingGoal(goal, pending, reference_frame_, endpoint.task_id);
+  goal.operation = apply ? goal.APPLY : goal.PLAN;
+  goal.preparation_id = apply ? pending.proposal.preparation_id : 0;
+  goal.full_trajectory = pending.wants_nominal;
+  planning_scene::PlanningScenePtr scene;
+  if (!context_->snapshot(pending.arm.joint_names, state_timeout_, state_max_age_, scene, error, canceled)) {return false;}
+  scene->getPlanningSceneMsg(goal.scene);
+  if (!moveit_node_->get_parameter("robot_description", goal.robot_description) ||
+      !moveit_node_->get_parameter("robot_description_semantic", goal.robot_description_semantic)) {
+    error = "Posture optimization requires the MoveIt URDF and SRDF"; return false;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+  rclcpp_action::ClientGoalHandle<PrepareAction>::WrappedResult wrapped;
+  if (!controllerRequest<PrepareAction>(endpoint.preparer, goal, deadline, canceled, wrapped, error)) {return false;}
+  if (wrapped.code != rclcpp_action::ResultCode::SUCCEEDED || !wrapped.result || !wrapped.result->success ||
+      !wrapped.result->proposal.preparation_id) {
+    error = wrapped.result ? wrapped.result->message : "Missing posture result"; return false;
+  }
+  if (pending.wants_nominal) {
+    WholeBodyNominal nominal;
+    if (!nominal.init(wrapped.result->nominal_joints, wrapped.result->nominal_base, error)) {
+      error = "Invalid nominal trajectory from the controller: " + error; return false;
+    }
+    if (nominal.frame() != reference_frame_) {
+      error = "Nominal trajectory frame differs from the planning frame"; return false;
+    }
+    pending.nominal = std::move(nominal);
+    pending.nominal_joints = wrapped.result->nominal_joints;
+    pending.nominal_base = wrapped.result->nominal_base;
+    pending.plan.joint_trajectory = pending.nominal_joints;
+    pending.plan.base_trajectory = pending.nominal_base;
+    visualization_->publishPoseNominal(pending.nominal_joints, pending.nominal_base, pending.views);
+    feedback(pending.handle, apply ? 0.8F : 0.5F, apply ? "nominal_replanned" : "nominal_planned",
+      "Whole-body nominal (" + wrapped.result->nominal_method + ", cost " +
+      std::to_string(wrapped.result->nominal_cost) + ", " + std::to_string(pending.nominal_joints.points.size()) +
+      " knots over " + std::to_string(pending.nominal.duration()) + " s)", &wrapped.result->proposal);
+  }
+  pending.proposal = wrapped.result->proposal;
+  pending.posture_applied = apply;
   return true;
 }
 
@@ -239,84 +382,49 @@ bool PlanCartesianTrajectoryActionServer::checkPoseTrajectory(
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   CheckAction::Goal goal;
-  goal.trajectory = pending.pose_path.descriptor(reference_frame_);
-  goal.task_id = pose_endpoints_.at(pending.arm.name).task_id;
-  goal.tip_frame = pending.arm.tip_frame;
-  const Eigen::Quaterniond tolerance(pending.goal.world_from_tolerance.rotation());
-  goal.tolerance_orientation.x = tolerance.x(); goal.tolerance_orientation.y = tolerance.y();
-  goal.tolerance_orientation.z = tolerance.z(); goal.tolerance_orientation.w = tolerance.w();
-  std::copy_n(pending.tracking_tolerances.tip_path.begin(), 6, goal.path_tolerance.begin());
-  std::copy_n(pending.tracking_tolerances.tip_goal.begin(), 6, goal.goal_tolerance.begin());
-  goal.goal_time_tolerance = rclcpp::Duration(pending.tracking_tolerances.goal_time_tolerance).seconds();
+  setTrackingGoal(goal, pending, reference_frame_, pose_endpoints_.at(pending.arm.name).task_id);
   goal.validation_id = validation_id;
-  // Handle late acceptance too, including cancellation while send_goal is in flight.
-  struct Dispatch {std::mutex mutex; bool canceled = false; CheckHandle::SharedPtr handle;};
-  auto dispatch = std::make_shared<Dispatch>();
-  rclcpp_action::Client<CheckAction>::SendGoalOptions options;
-  options.goal_response_callback = [dispatch, client](CheckHandle::SharedPtr handle) {
-      bool cancel = false;
-      {std::scoped_lock lock(dispatch->mutex); dispatch->handle = handle; cancel = dispatch->canceled;}
-      if (cancel && handle) {try {client->async_cancel_goal(handle);} catch (const std::exception &) {}}
-    };
-  const auto cancel_check = [&]() {
-      CheckHandle::SharedPtr handle;
-      {std::scoped_lock lock(dispatch->mutex); dispatch->canceled = true; handle = dispatch->handle;}
-      if (handle) {try {client->async_cancel_goal(handle);} catch (const std::exception &) {}}
-    };
-  try {
-    auto accepted = client->async_send_goal(goal, options);
-    while (accepted.wait_for(std::chrono::milliseconds(10)) != std::future_status::ready) {
-      if (canceled() || std::chrono::steady_clock::now() >= deadline) {
-        cancel_check(); error = "STPIK request canceled or timed out; feasibility unknown"; return false;
-      }
-    }
-    const auto handle = accepted.get();
-    if (!handle) {error = "STPIK request rejected: checker may be busy"; return false;}
-    auto result = client->async_get_result(handle);
-    while (result.wait_for(std::chrono::milliseconds(10)) != std::future_status::ready) {
-      if (canceled() || std::chrono::steady_clock::now() >= deadline) {
-        cancel_check(); error = "STPIK simulation canceled or timed out; feasibility unknown"; return false;
-      }
-    }
-    const auto wrapped = result.get();
-    if (!wrapped.result) {error = "STPIK returned no diagnostic"; return false;}
-    const auto & report = *wrapped.result;
-    if (wrapped.code == rclcpp_action::ResultCode::SUCCEEDED &&
-      report.outcome == CheckAction::Result::SUCCESS && report.validation_id != 0)
-    {validation_id = report.validation_id; return true;}
-    retryable = report.outcome != CheckAction::Result::FAIL;
-    std::ostringstream detail;
-    detail << "STPIK " << report.code << " at t=" << report.time_from_start << " s: " << report.message;
-    if (!report.task_id.empty()) {detail << "; task=" << report.task_id;}
-    if (!report.constraint.empty()) {detail << "; constraint=" << report.constraint;}
-    detail << "; q=[";
-    for (size_t i = 0; i < report.joint_positions.size(); ++i) {
-      if (i) {detail << ", ";}
-      if (i < report.joint_names.size()) {detail << report.joint_names[i] << '=';}
-      detail << report.joint_positions[i];
-    }
-    detail << "]; tip_error=[";
-    for (size_t i = 0; i < report.tracking_error.size(); ++i) {
-      if (i) {detail << ", ";} detail << report.tracking_error[i];
-    }
-    detail << "]; min_clearance=" << report.minimum_clearance
-           << "; max_velocity_ratio=" << report.maximum_velocity_ratio;
-    error = detail.str();
-    if (report.outcome == CheckAction::Result::FAIL && !canceled()) {
-      auto output = std::make_shared<Action::Feedback>();
-      output->progress = 0.8F;
-      output->current_stage = "stpik_failed";
-      output->message = error;
-      std::copy(report.tracking_error.begin(), report.tracking_error.end(), output->tip_error.begin());
-      try {pending.handle->publish_feedback(output);}
-      catch (const std::exception & exception) {
-        RCLCPP_DEBUG(get_logger(), "STPIK failure feedback unavailable: %s", exception.what());
-      }
-    }
-    return false;
-  } catch (const std::exception & exception) {
-    cancel_check(); error = "STPIK communication failed: " + std::string(exception.what()); return false;
+  if (pending.wants_nominal) {
+    goal.nominal_joints = pending.nominal_joints;
+    goal.nominal_base = pending.nominal_base;
   }
+  CheckHandle::WrappedResult wrapped;
+  if (!controllerRequest<CheckAction>(client, goal, deadline, canceled, wrapped, error)) {return false;}
+  if (!wrapped.result) {error = "STPIK returned no diagnostic"; return false;}
+  const auto & report = *wrapped.result;
+  if (wrapped.code == rclcpp_action::ResultCode::SUCCEEDED &&
+    report.outcome == CheckAction::Result::SUCCESS && report.validation_id != 0)
+  {validation_id = report.validation_id; return true;}
+  retryable = report.outcome != CheckAction::Result::FAIL;
+  std::ostringstream detail;
+  detail << "STPIK " << report.code << " at t=" << report.time_from_start << " s: " << report.message;
+  if (!report.task_id.empty()) {detail << "; task=" << report.task_id;}
+  if (!report.constraint.empty()) {detail << "; constraint=" << report.constraint;}
+  detail << "; q=[";
+  for (size_t i = 0; i < report.joint_positions.size(); ++i) {
+    if (i) {detail << ", ";}
+    if (i < report.joint_names.size()) {detail << report.joint_names[i] << '=';}
+    detail << report.joint_positions[i];
+  }
+  detail << "]; tip_error=[";
+  for (size_t i = 0; i < report.tracking_error.size(); ++i) {
+    if (i) {detail << ", ";} detail << report.tracking_error[i];
+  }
+  detail << "]; min_clearance=" << report.minimum_clearance
+         << "; max_velocity_ratio=" << report.maximum_velocity_ratio;
+  error = detail.str();
+  if (report.outcome == CheckAction::Result::FAIL && !canceled()) {
+    auto output = std::make_shared<Action::Feedback>();
+    output->progress = 0.8F;
+    output->current_stage = "stpik_failed";
+    output->message = error;
+    std::copy(report.tracking_error.begin(), report.tracking_error.end(), output->tip_error.begin());
+    try {pending.handle->publish_feedback(output);}
+    catch (const std::exception & exception) {
+      RCLCPP_DEBUG(get_logger(), "STPIK failure feedback unavailable: %s", exception.what());
+    }
+  }
+  return false;
 }
 
 void PlanCartesianTrajectoryActionServer::executePosePlan(const std::shared_ptr<PendingPlan> & pending)
@@ -333,6 +441,7 @@ void PlanCartesianTrajectoryActionServer::executePosePlan(const std::shared_ptr<
       return !rclcpp::ok() || stopped_.load() || !execution_active_.load() ||
         pending->handle->is_canceling() || !pending->handle->is_active();
     };
+  double last_nominal_time = 0.0;
   const auto publish_zero = [&]() {
       geometry_msgs::msg::TwistStamped zero;
       zero.header.frame_id = reference_frame_; zero.header.stamp = now();
@@ -345,6 +454,14 @@ void PlanCartesianTrajectoryActionServer::executePosePlan(const std::shared_ptr<
       return;
     }
     if (!validatePosePending(*pending, error)) {finish(pending, false, error); return;}
+    if (pending->wants_nominal && pending->nominal.empty()) {
+      finish(pending, false, "Whole-body nominal trajectory is unavailable"); return;
+    }
+    if ((pending->handle->get_goal()->optimize_initial_posture || pending->wants_nominal) &&
+      !pending->posture_applied &&
+        (!preparePosture(*pending, true, error) || !validatePosePending(*pending, error))) {
+      finish(pending, false, error); return;
+    }
     if (pending->handle->get_goal()->use_stpik) {
       // This gate precedes ALL target/feedforward publications and parameter writes.
       uint64_t validation_id = 0;
@@ -408,17 +525,27 @@ void PlanCartesianTrajectoryActionServer::executePosePlan(const std::shared_ptr<
       feedforward.twist.angular.z = velocity(5);
       endpoint.target->publish(poseMessage(desired, reference_frame_, time));
       endpoint.feedforward->publish(feedforward);
+      if (pending->wants_nominal) {
+        msg::RobotNominalReference reference;
+        if (!pending->nominal.reference(elapsed, time, reference, error, !advancing)) {
+          error = "Nominal sampling failed: " + error; break;
+        }
+        endpoint.nominal->publish(reference);
+        last_nominal_time = elapsed;
+      }
       const auto tracking = poseError(desired, measured, pending->goal.world_from_tolerance.rotation());
+      const auto active_tracking = poseError(desired, measured,
+        pending->goal.world_from_tolerance.rotation(), pending->pose_activation);
       auto output = std::make_shared<Action::Feedback>();
       output->progress = static_cast<float>(0.8 + 0.2 * (duration > 0.0 ? std::clamp(elapsed / duration, 0.0, 1.0) : 1.0));
       output->current_stage = elapsed >= duration ? "converging_pose" : "tracking_pose";
       output->message = "Streaming Cartesian references to " + endpoint.task_id;
       std::copy(tracking.data(), tracking.data() + 6, output->tip_error.begin());
       pending->handle->publish_feedback(output);
-      if (elapsed >= duration && within(tracking, pending->tracking_tolerances.tip_goal)) {
+      if (elapsed >= duration && within(active_tracking, pending->tracking_tolerances.tip_goal)) {
         success = true; error = "Cartesian pose target reached"; break;
       }
-      if (elapsed < duration && !within(tracking, pending->tracking_tolerances.tip_path)) {
+      if (elapsed < duration && !within(active_tracking, pending->tracking_tolerances.tip_path)) {
         error = "Cartesian pose path tracking tolerance violated"; break;
       }
       if (elapsed > duration + allowance) {error = "Cartesian pose goal tracking tolerance timed out"; break;}
@@ -436,6 +563,14 @@ void PlanCartesianTrajectoryActionServer::executePosePlan(const std::shared_ptr<
       // On TF loss, retain the last valid measurement rather than a future target.
       readTipPose(*pending, measured, measured_error);
       endpoint.target->publish(poseMessage(measured, reference_frame_, now()));
+      if (pending->wants_nominal) {
+        // Stop the stream at rest; synchronized holds keep this last reference.
+        msg::RobotNominalReference reference;
+        std::string nominal_error;
+        if (pending->nominal.reference(last_nominal_time, now(), reference, nominal_error, true)) {
+          endpoint.nominal->publish(reference);
+        }
+      }
       std::string restore_error;
       if (!setAutoUpdate(setter, parameter_name, auto_update, execution_options_.controller_wait_timeout, restore_error)) {
         success = false; error += "; restoring auto_update_target_pose failed: " + restore_error;

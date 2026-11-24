@@ -1,4 +1,5 @@
 #include "sura_manipulation_actions/cartesian_pose_path.hpp"
+#include "sura_manipulation_actions/cartesian_tracking.hpp"
 
 #include <gtest/gtest.h>
 
@@ -241,6 +242,21 @@ TEST(CartesianPosePathTest, TimedDescriptorPreservesTranslationOrientationAndFee
       EXPECT_TRUE(live.sampleVelocity(time).isApprox(offline.sampleVelocity(time), 1e-12));
     }
   }
+}
+
+TEST(CartesianTrackingTest, ActivationIsAppliedInWorldBeforeRotatingToleranceAxes)
+{
+  const auto desired = pose(Eigen::Vector3d(0.2, 0.3, 0.4), 0.6);
+  const auto measured = Eigen::Isometry3d::Identity();
+  const Eigen::Matrix3d axes = Eigen::AngleAxisd(0.7, Eigen::Vector3d::UnitY()).toRotationMatrix();
+  Eigen::Matrix<double,6,1> mask;
+  mask << 1,0,0,0,0,0;
+  const auto projected = cartesianTrackingError(desired, measured, axes, mask);
+  EXPECT_TRUE(projected.head<3>().isApprox(axes.transpose() * Eigen::Vector3d(0.2,0,0)));
+  EXPECT_TRUE(projected.tail<3>().isZero());
+  const auto raw = cartesianTrackingError(desired, measured, axes);
+  EXPECT_TRUE(raw.head<3>().isApprox(axes.transpose() * desired.translation()));
+  EXPECT_TRUE(raw.tail<3>().isApprox(axes.transpose() * Eigen::Vector3d(0,0,0.6)));
 }
 
 }  // namespace

@@ -18,8 +18,8 @@ def _as_float(context, launch_config):
 def _arm_local_solution_topic(context, arm):
     robot_namespace = LaunchConfiguration("robot_namespace").perform(context).strip("/")
     backend = LaunchConfiguration("execution_backend").perform(context)
-    prefix = f"/{robot_namespace}/controller" if robot_namespace else "/controller"
     if backend == "task":
+        prefix = f"/{robot_namespace}/alpha/controller" if robot_namespace else "/alpha/controller"
         return f"{prefix}/task_priority/tasks/{arm}_joint_trajectory/joint_trajectory"
     alpha_prefix = f"/{robot_namespace}/alpha/controller" if robot_namespace else "/alpha/controller"
     return f"{alpha_prefix}/alpha_{arm}_joint_trajectory_controller/joint_trajectory"

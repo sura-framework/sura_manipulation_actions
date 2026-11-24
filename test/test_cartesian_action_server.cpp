@@ -1,6 +1,7 @@
 #include "sura_manipulation_actions/plan_cartesian_trajectory_action_server.hpp"
 
 #include <gtest/gtest.h>
+#include "sura_manipulation_actions/whole_body_nominal.hpp"
 
 #include <algorithm>
 #include <array>
@@ -101,6 +102,7 @@ protected:
       fake_->declare_parameter(prefix + "frame_id", std::string(side) + "_tip");
       fake_->declare_parameter(prefix + "plugin", std::string("task_priority_kinematic_control/FramePoseTask"));
       fake_->declare_parameter(prefix + "auto_update_target_pose", true);
+      fake_->declare_parameter(prefix + "activation", std::vector<int64_t>{});
     }
     dynamic_tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(fake_);
     auto node_options = rclcpp::NodeOptions();
@@ -701,6 +703,50 @@ TEST_F(SingleCartesianActionServerTest, PoseExecutionSelectsEachArmAndRestoresAu
   EXPECT_EQ(switch_requests_.load(), 0);
 }
 
+TEST_F(SingleCartesianActionServerTest, PoseExecutionRetriesBusyParameterPreparationAndRestoration)
+{
+  backend_active_.store(true);
+  const std::array<std::string, 2> reasons = {
+    "Task priority is busy; retry the parameter update",
+    "A controller update is in progress; retry the parameter change"};
+  for (std::size_t side = 0; side < reasons.size(); ++side) {
+    SCOPED_TRACE(reasons[side]);
+    auto disabling = std::make_shared<std::atomic<unsigned>>(0);
+    auto restoring = std::make_shared<std::atomic<unsigned>>(0);
+    const auto parameter_name = side == 0 ? "tasks.left_pose.auto_update_target_pose" :
+      "tasks.right_pose.auto_update_target_pose";
+    const auto callback = fake_->add_on_set_parameters_callback(
+      [disabling, restoring, parameter_name, reason = reasons[side]](
+        const std::vector<rclcpp::Parameter> & parameters) {
+        rcl_interfaces::msg::SetParametersResult response;
+        response.successful = true;
+        for (const auto & parameter : parameters) {
+          if (parameter.get_name() != parameter_name) {continue;}
+          auto & attempts = parameter.as_bool() ? *restoring : *disabling;
+          if (attempts.fetch_add(1) < 2) {
+            response.successful = false;
+            response.reason = reason;
+          }
+        }
+        return response;
+      });
+    auto request = poseGoal(true, side == 1);
+    request.use_stpik = false;
+    auto handle = sendGoal(request);
+    ASSERT_TRUE(handle);
+    auto result = client_->async_get_result(handle);
+    ASSERT_EQ(result.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    const auto finished = result.get();
+    ASSERT_TRUE(finished.result);
+    EXPECT_EQ(finished.code, rclcpp_action::ResultCode::SUCCEEDED);
+    EXPECT_TRUE(finished.result->success) << finished.result->message;
+    EXPECT_EQ(disabling->load(), 3u);
+    EXPECT_EQ(restoring->load(), 3u);
+    EXPECT_TRUE(automaticTarget(side == 1));
+    fake_->remove_on_set_parameters_callback(callback.get());
+  }
+}
+
 TEST_F(SingleCartesianActionServerTest, StpikFailureBlocksBothPoseExecutionEntrypointsWithoutWritingToTask)
 {
   backend_active_.store(true); check_outcome_.store(CheckAction::Result::FAIL);
@@ -739,6 +785,138 @@ TEST_F(SingleCartesianActionServerTest, StpikDefaultsToEnabledAndReceivesTheGoal
   std::lock_guard<std::mutex> lock(observation_mutex_);
   EXPECT_DOUBLE_EQ(checked_goal_.path_tolerance[2], 0.21);
   EXPECT_DOUBLE_EQ(checked_goal_.goal_tolerance[2], 0.22);
+}
+
+TEST_F(SingleCartesianActionServerTest, PostureProposalIsPreviewedAndAppliedOnceBeforeStpik)
+{
+  using Prepare = sura_manipulation_actions::action::PrepareCartesianPosture;
+  using PrepareHandle = rclcpp_action::ServerGoalHandle<Prepare>;
+  std::atomic_int plans{0}, applies{0};
+  auto server = rclcpp_action::create_server<Prepare>(fake_, ns_ + "/task_priority/prepare_cartesian_posture",
+    [](const rclcpp_action::GoalUUID &, std::shared_ptr<const Prepare::Goal>) {
+      return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+    }, [](std::shared_ptr<PrepareHandle>) {return rclcpp_action::CancelResponse::ACCEPT;},
+    [&](std::shared_ptr<PrepareHandle> handle) {
+      const auto & request = *handle->get_goal();
+      EXPECT_EQ(request.tip_frame, "left_tip");
+      EXPECT_FALSE(request.robot_description.empty());
+      EXPECT_FALSE(request.scene.is_diff);
+      if (request.operation == request.PLAN) {
+        EXPECT_EQ(request.preparation_id, 0u);
+        ++plans;
+      } else {
+        EXPECT_EQ(request.preparation_id, 71u);
+        EXPECT_EQ(check_requests_.load(), 0);
+        ++applies;
+      }
+      auto response = std::make_shared<Prepare::Result>();
+      response->success = true;
+      response->proposal.preparation_id = 71;
+      handle->succeed(response);
+    });
+  backend_active_.store(true);
+  auto request = poseGoal();
+  request.optimize_initial_posture = true;
+  auto handle = sendGoal(request);
+  ASSERT_TRUE(handle);
+  auto result = client_->async_get_result(handle);
+  ASSERT_TRUE(waitUntil([this](){return waiting();}));
+  EXPECT_EQ(plans.load(), 1);
+  EXPECT_EQ(applies.load(), 0);
+  {std::lock_guard<std::mutex> lock(observation_mutex_);
+    EXPECT_EQ(last_feedback_.proposal.preparation_id, 71u);
+    EXPECT_TRUE(pose_targets_[0].empty());}
+  auto executed = trigger(execute_);
+  ASSERT_TRUE(executed && executed->success);
+  ASSERT_EQ(result.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  auto finished = result.get();
+  ASSERT_TRUE(finished.result);
+  EXPECT_TRUE(finished.result->success) << finished.result->message;
+  EXPECT_EQ(finished.result->proposal.preparation_id, 71u);
+  EXPECT_EQ(applies.load(), 1);
+  EXPECT_EQ(check_requests_.load(), 2);
+}
+
+TEST_F(SingleCartesianActionServerTest, WholeBodyNominalIsPlannedCheckedAndStreamed)
+{
+  using Prepare = sura_manipulation_actions::action::PrepareCartesianPosture;
+  using PrepareHandle = rclcpp_action::ServerGoalHandle<Prepare>;
+  std::atomic_int plans{0}, applies{0}, full{0};
+  const auto nominal = [](double shift) {
+      std::vector<double> times{0.0, 0.5, 1.0};
+      std::vector<sura_manipulation_actions::BaseCoordinates> base(3, sura_manipulation_actions::BaseCoordinates::Zero());
+      std::vector<Eigen::VectorXd> joints(3, Eigen::VectorXd::Zero(2));
+      for (size_t k = 0; k < 3; ++k) {base[k](0) = shift + 0.01 * k; joints[k](0) = 0.1 * k;}
+      trajectory_msgs::msg::JointTrajectory joint_msg;
+      trajectory_msgs::msg::MultiDOFJointTrajectory base_msg;
+      std::string error;
+      EXPECT_TRUE(sura_manipulation_actions::buildWholeBodyNominal(times, base, joints,
+        {"left_joint", "right_joint"}, "base", joint_msg, base_msg, error)) << error;
+      return std::make_pair(joint_msg, base_msg);
+    };
+  auto server = rclcpp_action::create_server<Prepare>(fake_, ns_ + "/task_priority/prepare_cartesian_posture",
+    [](const rclcpp_action::GoalUUID &, std::shared_ptr<const Prepare::Goal>) {
+      return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+    }, [](std::shared_ptr<PrepareHandle>) {return rclcpp_action::CancelResponse::ACCEPT;},
+    [&](std::shared_ptr<PrepareHandle> handle) {
+      const auto & request = *handle->get_goal();
+      full += request.full_trajectory ? 1 : 0;
+      (request.operation == request.PLAN ? plans : applies)++;
+      auto response = std::make_shared<Prepare::Result>();
+      response->success = true;
+      response->proposal.preparation_id = 72;
+      const auto trajectory = nominal(request.operation == request.PLAN ? 0.0 : 0.002);
+      response->nominal_joints = trajectory.first;
+      response->nominal_base = trajectory.second;
+      response->nominal_method = "stpik_rollout+sqp";
+      handle->succeed(response);
+    });
+  std::mutex nominal_mutex;
+  std::vector<sura_manipulation_actions::msg::RobotNominalReference> references;
+  auto nominal_sub = fake_->create_subscription<sura_manipulation_actions::msg::RobotNominalReference>(
+    ns_ + "/task_priority/tasks/robot_nominal/reference", rclcpp::QoS(10),
+    [&](sura_manipulation_actions::msg::RobotNominalReference::ConstSharedPtr msg) {
+      std::lock_guard<std::mutex> lock(nominal_mutex); references.push_back(*msg);
+    });
+  backend_active_.store(true);
+  auto request = poseGoal();
+  request.optimize_trajectory_nominal = true;
+  auto handle = sendGoal(request);
+  ASSERT_TRUE(handle);
+  auto result = client_->async_get_result(handle);
+  ASSERT_TRUE(waitUntil([this](){return waiting();}));
+  EXPECT_EQ(plans.load(), 1);
+  auto executed = trigger(execute_);
+  ASSERT_TRUE(executed && executed->success);
+  ASSERT_EQ(result.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  auto finished = result.get();
+  ASSERT_TRUE(finished.result);
+  EXPECT_TRUE(finished.result->success) << finished.result->message;
+  EXPECT_EQ(applies.load(), 1);
+  EXPECT_EQ(full.load(), 2);
+  // The applied (replanned) nominal is reported, checked and streamed.
+  ASSERT_EQ(finished.result->base_trajectory.points.size(), 3u);
+  EXPECT_NEAR(finished.result->base_trajectory.points.front().transforms.front().translation.x, 0.002, 1e-12);
+  {std::lock_guard<std::mutex> lock(observation_mutex_);
+    ASSERT_EQ(checked_goal_.nominal_joints.points.size(), 3u);
+    EXPECT_NEAR(checked_goal_.nominal_base.points.front().transforms.front().translation.x, 0.002, 1e-12);}
+  ASSERT_TRUE(waitUntil([&]() {std::lock_guard<std::mutex> lock(nominal_mutex); return references.size() >= 3;}));
+  std::lock_guard<std::mutex> lock(nominal_mutex);
+  EXPECT_EQ(references.front().header.frame_id, "base");
+  EXPECT_EQ(references.front().joint_names, (std::vector<std::string>{"left_joint", "right_joint"}));
+  // The stream ends at rest.
+  EXPECT_DOUBLE_EQ(references.back().velocities.at(0), 0.0);
+}
+
+TEST_F(SingleCartesianActionServerTest, WholeBodyNominalRequiresPoseAndStpik)
+{
+  auto request = poseGoal();
+  request.optimize_trajectory_nominal = true;
+  request.use_stpik = false;
+  auto handle = sendGoal(request);
+  EXPECT_FALSE(handle);  request.use_stpik = true;
+  request.optimize_initial_posture = true;
+  EXPECT_FALSE(sendGoal(request));
 }
 
 TEST_F(SingleCartesianActionServerTest, PoseCanSkipStpikForImmediateAndPendingExecutionWithoutAChecker)
@@ -929,6 +1107,33 @@ TEST_F(SingleCartesianActionServerTest, PoseExecutionRetainsPendingPlanWhenTaskF
   EXPECT_TRUE(finished.result->success) << finished.result->message;
   EXPECT_TRUE(automaticTarget());
   EXPECT_EQ(backend_requests_.load(), 0);
+}
+
+TEST_F(SingleCartesianActionServerTest, PoseExecutionIgnoresMaskedOrientationForBothArms)
+{
+  backend_active_.store(true);
+  pose_tracks_.store(false);
+  for (const bool right : {false, true}) {
+    SCOPED_TRACE(right);
+    const std::string name = right ? "tasks.right_pose.activation" : "tasks.left_pose.activation";
+    ASSERT_TRUE(fake_->set_parameter(rclcpp::Parameter(name,
+      std::vector<int64_t>{1,1,1,0,0,0})).successful);
+    auto request = poseGoal(true, right);
+    request.use_stpik = false;
+    request.target_pose.pose.position.x = right ? 1.0 : -1.0;
+    request.target_pose.pose.orientation.z = std::sin(0.1);
+    request.target_pose.pose.orientation.w = std::cos(0.1);
+    request.tracking_tolerances.tip_path = {0.001,0.001,0.001,0.001,0.001,0.001};
+    request.tracking_tolerances.tip_goal = request.tracking_tolerances.tip_path;
+    auto handle = sendGoal(request);
+    ASSERT_TRUE(handle);
+    auto result = client_->async_get_result(handle);
+    ASSERT_EQ(result.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    const auto finished = result.get();
+    ASSERT_TRUE(finished.result);
+    EXPECT_TRUE(finished.result->success) << finished.result->message;
+    EXPECT_TRUE(automaticTarget(right));
+  }
 }
 
 TEST_F(SingleCartesianActionServerTest, PoseExecutionAbortsOnCartesianTrackingErrorAndRestoresTask)
@@ -1313,6 +1518,8 @@ TEST_F(SingleCartesianActionServerTest, ControllerSuccessRequiresMeasuredToolTra
 {
   backend_active_.store(true); controller_tracks_.store(false);
   auto request = goal(true, false, "controller");
+  // The fixture commands 10 mm of travel. Make a stationary tool fail the tracking check.
+  request.tracking_tolerances.tip_goal = std::vector<double>(6, 0.001);
   request.velocity_scaling = request.acceleration_scaling = 0.5;
   auto handle = sendGoal(request);
   ASSERT_TRUE(handle);

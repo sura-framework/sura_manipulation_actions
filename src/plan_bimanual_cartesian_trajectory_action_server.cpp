@@ -9,12 +9,18 @@
 #include <type_traits>
 #include <utility>
 
+#include <sstream>
+
+#include "builtin_interfaces/msg/duration.hpp"
+#include "rclcpp_action/rclcpp_action.hpp"
 #include "moveit/robot_model/revolute_joint_model.h"
+#include "moveit/robot_state/robot_state.h"
 
 namespace sura_manipulation_actions
 {
 namespace
 {
+using CheckAction = sura_manipulation_actions::action::CheckCartesianTrajectory;
 template<typename T>
 T parameter(rclcpp_lifecycle::LifecycleNode & node, const std::string & name, const T & fallback)
 {
@@ -77,8 +83,8 @@ bool PlanBimanualCartesianTrajectoryActionServer::loadConfiguration(std::string 
   moveit_namespace_ = parameter<std::string>(*this, "moveit_namespace", "moveit");
   action_name_ = parameter<std::string>(*this, "action_name", topic("manipulation/plan_bimanual_cartesian_trajectory"));
   execution_backend_ = parameter<std::string>(*this, "execution_backend", "controller");
-  if (execution_backend_ != "controller" && execution_backend_ != "task") {
-    error = "execution_backend must be controller or task"; return false;
+  if (execution_backend_ != "controller" && execution_backend_ != "task" && execution_backend_ != "pose") {
+    error = "execution_backend must be controller, task or pose"; return false;
   }
   fixed_frame_ = parameter<std::string>(*this, "visualization.fixed_frame", "");
   relative_reference_frame_ = parameter<std::string>(*this, "relative_reference_frame", "");
@@ -186,6 +192,56 @@ bool PlanBimanualCartesianTrajectoryActionServer::loadConfiguration(std::string 
     {error = "Invalid or duplicate pair: " + name; return false;}
   }
   if (arms_.size() < 2 || pairs_.empty()) {error = "Configure arm_names and pair_names for at least two arms"; return false;}
+  // Pose endpoints are always prepared so that a goal can select the pose backend.
+  {
+    tip_path_tolerance_ = parameter<std::vector<double>>(*this, "execution.tip_path_tolerance", tip_path_tolerance_);
+    tip_goal_tolerance_ = parameter<std::vector<double>>(*this, "execution.tip_goal_tolerance", tip_goal_tolerance_);
+    goal_time_tolerance_ = parameter<double>(*this, "execution.goal_time_tolerance", goal_time_tolerance_);
+    stpik_timeout_ = parameter<double>(*this, "pose.stpik_timeout", stpik_timeout_);
+    if (tip_path_tolerance_.size() != 6 || tip_goal_tolerance_.size() != 6 ||
+      std::any_of(tip_path_tolerance_.begin(), tip_path_tolerance_.end(), [](double v) {return !std::isfinite(v) || v < 0.0;}) ||
+      std::any_of(tip_goal_tolerance_.begin(), tip_goal_tolerance_.end(), [](double v) {return !std::isfinite(v) || v < 0.0;}) ||
+      !std::isfinite(goal_time_tolerance_) || goal_time_tolerance_ < 0.0 ||
+      !std::isfinite(stpik_timeout_) || stpik_timeout_ <= 0.0)
+    {
+      error = "Pose tolerances must contain six finite nonnegative values; stpik_timeout must be positive";
+      return false;
+    }
+    // Each arm streams to its own task-priority pose task (left_pose / right_pose by default).
+    for (const auto & entry : arms_) {
+      const auto & arm = entry.second;
+      const auto prefix = "arms." + arm.name + ".";
+      PoseEndpoint pose;
+      pose.arm_name = arm.name;
+      const auto manager_suffix = arm.manager_service.rfind("/controller_manager/list_controllers");
+      const auto controller_namespace = manager_suffix != std::string::npos ?
+        arm.manager_service.substr(0, manager_suffix) : "/" + robot_namespace_ + "/controller";
+      pose.task_id = parameter<std::string>(*this, prefix + "pose_task",
+        arm.name.find("right") != std::string::npos ? "right_pose" :
+        arm.name.find("left") != std::string::npos ? "left_pose" : arm.name + "_pose");
+      pose.controller_node = parameter<std::string>(*this, prefix + "pose_controller_node",
+        controller_namespace + "/task_priority_controller");
+      pose.target_topic = parameter<std::string>(*this, prefix + "pose_target_topic",
+        controller_namespace + "/task_priority/tasks/" + pose.task_id + "/target");
+      const auto feedforward_suffix = std::string("/target");
+      const auto default_feedforward = pose.target_topic.size() > feedforward_suffix.size() &&
+        pose.target_topic.compare(pose.target_topic.size() - feedforward_suffix.size(),
+        feedforward_suffix.size(), feedforward_suffix) == 0 ?
+        pose.target_topic.substr(0, pose.target_topic.size() - feedforward_suffix.size()) + "/feedforward" :
+        controller_namespace + "/task_priority/tasks/" + pose.task_id + "/feedforward";
+      pose.feedforward_topic = parameter<std::string>(*this, prefix + "pose_feedforward_topic", default_feedforward);
+      const auto tasks_separator = pose.target_topic.rfind("/tasks/");
+      pose.check_action = parameter<std::string>(*this, prefix + "pose_stpik_action",
+        (tasks_separator == std::string::npos ? controller_namespace + "/task_priority" :
+        pose.target_topic.substr(0, tasks_separator)) + "/check_cartesian_trajectory");
+      if (pose.task_id.empty() || pose.controller_node.empty() || pose.target_topic.empty() || pose.feedforward_topic.empty() ||
+        pose.check_action.empty())
+      {
+        error = "Pose endpoint cannot be empty for arm: " + arm.name; return false;
+      }
+      pose_endpoints_.emplace(arm.name, std::move(pose));
+    }
+  }
   return true;
 }
 
@@ -275,6 +331,13 @@ PlanBimanualCartesianTrajectoryActionServer::on_configure(const rclcpp_lifecycle
       moveit_node_, topic("bimanual_planner"), topic("manipulation"), fixed_frame_,
       parameter<bool>(*this, "visualization.publish_paths", true),
       parameter<bool>(*this, "visualization.publish_markers", true));
+    for (auto & entry : pose_endpoints_) {
+      entry.second.target = moveit_node_->create_publisher<geometry_msgs::msg::PoseStamped>(
+        entry.second.target_topic, rclcpp::QoS(1).reliable());
+      entry.second.feedforward = moveit_node_->create_publisher<geometry_msgs::msg::TwistStamped>(
+        entry.second.feedforward_topic, rclcpp::QoS(1).reliable());
+      entry.second.checker = rclcpp_action::create_client<CheckAction>(moveit_node_, entry.second.check_action);
+    }
     executor_ = std::make_unique<TrajectoryExecutor>(this);
     clients_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     action_ = rclcpp_action::create_server<Action>(
@@ -329,6 +392,11 @@ bool PlanBimanualCartesianTrajectoryActionServer::validateGoal(
   if (arm_a == arm_b) {error = "Arm A and arm B must be different arms"; return false;}
   if (goal.relative_target.header.frame_id != relative_reference_frame_) {
     error = "relative_target.frame_id must equal configured reference frame '" + relative_reference_frame_ + "'"; return false;
+  }
+  pending.backend = goal.execution_backend.empty() ? execution_backend_ : goal.execution_backend;
+  pending.use_stpik = goal.use_stpik;
+  if (pending.backend != "controller" && pending.backend != "task" && pending.backend != "pose") {
+    error = "execution_backend must be empty, controller, task or pose"; return false;
   }
   pending.arm_a = arm_a->second; pending.arm_b = arm_b->second;
   bool found = false;
@@ -451,8 +519,10 @@ bool PlanBimanualCartesianTrajectoryActionServer::backendReady(const PendingPlan
     return false;
   }
   std::map<std::string, std::set<std::string>> required;
-  if (execution_backend_ == "task") {
-    if (pending.pair.task_action.empty()) {error = "No joint task action configured"; return false;}
+  if (pending.backend == "task" || pending.backend == "pose") {
+    if (pending.backend == "task" && pending.pair.task_action.empty()) {
+      error = "No joint task action configured"; return false;
+    }
     if (!pending.pair.task_manager_service.empty()) {
       required[pending.pair.task_manager_service].insert(pending.pair.task_controller_name);
     }
@@ -536,9 +606,10 @@ void PlanBimanualCartesianTrajectoryActionServer::executePlan(const std::shared_
       return;
     }
     if (!validatePending(*pending, error)) {finish(pending, false, error); return;}
+    if (pending->backend == "pose") {executePosePlan(pending); return;}
     std::vector<ExecutionTarget> targets;
     auto options = execution_options_;
-    if (execution_backend_ == "task") {
+    if (pending->backend == "task") {
       targets.push_back({"bimanual_joint_task", pending->pair.task_action, {}});
       options.use_common_start_stamp = false;
       options.start_delay = 0.0;
@@ -555,6 +626,265 @@ void PlanBimanualCartesianTrajectoryActionServer::executePlan(const std::shared_
       retain(pending, result.message + "; plan retained. Check the enabled joint trajectory task and retry the execute service");
     } else {finish(pending, result.success, result.message);}
   } catch (const std::exception & ex) {executor_->cancel(); finish(pending, false, std::string("Execution exception: ") + ex.what());}
+}
+
+bool PlanBimanualCartesianTrajectoryActionServer::setAutoUpdate(
+  PoseEndpoint & endpoint, bool enabled, std::string & error)
+{
+  const double timeout = execution_options_.controller_wait_timeout;
+  if (!endpoint.setter) {
+    endpoint.setter = moveit_node_->create_client<rcl_interfaces::srv::SetParametersAtomically>(
+      endpoint.controller_node + "/set_parameters_atomically");
+  }
+  if (!endpoint.setter->wait_for_service(std::chrono::duration<double>(timeout))) {
+    error = "Parameter service unavailable: " + endpoint.controller_node; return false;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout);
+  do {
+    auto input = std::make_shared<rcl_interfaces::srv::SetParametersAtomically::Request>();
+    input->parameters.push_back(rclcpp::Parameter(
+        "tasks." + endpoint.task_id + ".auto_update_target_pose", enabled).to_parameter_msg());
+    const double remaining = std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count();
+    auto future = endpoint.setter->async_send_request(input);
+    if (future.wait_for(std::chrono::duration<double>(std::max(0.0, remaining))) != std::future_status::ready) {
+      endpoint.setter->remove_pending_request(future);
+      error = "Timed out changing auto_update_target_pose on " + endpoint.task_id; return false;
+    }
+    const auto response = future.get();
+    if (response->result.successful) {return true;}
+    error = response->result.reason;
+    // The task priority controller rejects parameter updates while it is busy; retry until the deadline.
+    const bool busy = error.find("retry the parameter change") != std::string::npos ||
+      error.find("retry the parameter update") != std::string::npos;
+    if (!busy) {return false;}
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  } while (std::chrono::steady_clock::now() < deadline);
+  return false;
+}
+
+bool PlanBimanualCartesianTrajectoryActionServer::checkPoseSamples(
+  const std::shared_ptr<PendingPlan> & pending, PoseEndpoint & endpoint,
+  std::vector<sura_manipulation_actions::msg::CartesianPoseSample> samples,
+  bool & retryable, std::string & error)
+{
+  retryable = true;
+  const auto canceled = [this, pending]() {
+      return stopped_.load() || !execution_active_.load() ||
+        pending->handle->is_canceling() || !pending->handle->is_active();
+    };
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(stpik_timeout_);
+  while (!endpoint.checker->action_server_is_ready()) {
+    if (canceled()) {error = "STPIK canceled"; return false;}
+    if (std::chrono::steady_clock::now() >= deadline) {
+      error = "STPIK checker unavailable: " + endpoint.check_action; return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  CheckAction::Goal goal;
+  // The checker compares this frame with the controller world frame.
+  goal.trajectory.header.frame_id = context_->model()->getModelFrame();
+  goal.samples = std::move(samples);
+  goal.task_id = endpoint.task_id;
+  goal.tip_frame = arms_.at(endpoint.arm_name).tip_frame;
+  // Poses are absolute tip poses; the orientation tolerance is taken in the model frame.
+  goal.tolerance_orientation.w = 1.0;
+  std::copy_n(tip_path_tolerance_.begin(), 6, goal.path_tolerance.begin());
+  std::copy_n(tip_goal_tolerance_.begin(), 6, goal.goal_tolerance.begin());
+  goal.goal_time_tolerance = goal_time_tolerance_;
+  goal.validation_id = 0;
+  try {
+    auto accepted = endpoint.checker->async_send_goal(goal);
+    while (accepted.wait_for(std::chrono::milliseconds(10)) != std::future_status::ready) {
+      if (canceled() || std::chrono::steady_clock::now() >= deadline) {
+        error = "STPIK request canceled or timed out; feasibility unknown"; return false;
+      }
+    }
+    const auto handle = accepted.get();
+    if (!handle) {error = "STPIK request rejected: checker may be busy"; return false;}
+    auto result = endpoint.checker->async_get_result(handle);
+    while (result.wait_for(std::chrono::milliseconds(10)) != std::future_status::ready) {
+      if (canceled() || std::chrono::steady_clock::now() >= deadline) {
+        endpoint.checker->async_cancel_goal(handle);
+        error = "STPIK simulation canceled or timed out; feasibility unknown"; return false;
+      }
+    }
+    const auto wrapped = result.get();
+    if (!wrapped.result) {error = "STPIK returned no diagnostic"; return false;}
+    const auto & report = *wrapped.result;
+    if (wrapped.code == rclcpp_action::ResultCode::SUCCEEDED &&
+      report.outcome == CheckAction::Result::SUCCESS)
+    {return true;}
+    retryable = report.outcome != CheckAction::Result::FAIL;
+    std::ostringstream detail;
+    detail << "STPIK " << report.code << " at t=" << report.time_from_start << " s: " << report.message;
+    if (!report.task_id.empty()) {detail << "; task=" << report.task_id;}
+    if (!report.constraint.empty()) {detail << "; constraint=" << report.constraint;}
+    error = detail.str();
+    return false;
+  } catch (const std::exception & exception) {
+    error = "STPIK communication failed: " + std::string(exception.what());
+    return false;
+  }
+}
+
+void PlanBimanualCartesianTrajectoryActionServer::executePosePlan(const std::shared_ptr<PendingPlan> & pending)
+{
+  std::string error;
+  std::vector<PoseEndpoint *> disabled;
+  const auto canceled = [this, pending]() {
+      return stopped_.load() || !execution_active_.load() ||
+        pending->handle->is_canceling() || !pending->handle->is_active();
+    };
+  const auto restore = [this, &disabled]() {
+      for (auto * endpoint : disabled) {
+        std::string restore_error;
+        if (!setAutoUpdate(*endpoint, true, restore_error)) {
+          RCLCPP_ERROR(get_logger(), "Cannot restore auto_update_target_pose on %s: %s",
+            endpoint->task_id.c_str(), restore_error.c_str());
+        }
+      }
+      disabled.clear();
+    };
+  try {
+    const auto & trajectory = pending->plan.joint_trajectory;
+    if (trajectory.points.size() < 2) {throw std::runtime_error("Pose backend needs at least two trajectory points");}
+    const auto & names = trajectory.joint_names;
+    const auto & robot = context_->model();
+    // Pose tasks track absolute tip poses in the model (world) frame.
+    const std::string reference_frame = robot->getModelFrame();
+    const auto seconds = [](const builtin_interfaces::msg::Duration & duration) {
+        return rclcpp::Duration(duration).seconds();
+      };
+    const double duration = seconds(trajectory.points.back().time_from_start);
+
+    const auto sample_pose = [&](double elapsed, const std::string & arm_name) {
+        // Linear interpolation of the planned joints, then forward kinematics.
+        std::size_t index = 1;
+        while (index + 1 < trajectory.points.size() && seconds(trajectory.points[index].time_from_start) < elapsed) {++index;}
+        const auto & a = trajectory.points[index - 1];
+        const auto & b = trajectory.points[index];
+        const double ta = seconds(a.time_from_start);
+        const double tb = seconds(b.time_from_start);
+        const double s = tb > ta ? std::clamp((elapsed - ta) / (tb - ta), 0.0, 1.0) : 1.0;
+        std::vector<double> positions(a.positions.size());
+        for (std::size_t j = 0; j < positions.size(); ++j) {
+          positions[j] = a.positions[j] + s * (b.positions[j] - a.positions[j]);
+        }
+        moveit::core::RobotState state(robot);
+        state.setVariablePositions(names, positions);
+        state.update();
+        return state.getGlobalLinkTransform(arms_.at(arm_name).tip_frame);
+      };
+    // Samples for STPIK: the same poses that are streamed, on a 10 ms grid ending at the goal time.
+    const double check_step = 0.01;
+    std::vector<double> times;
+    for (double t = 0.0; t < duration; t += check_step) {times.push_back(t);}
+    times.push_back(duration);
+    const auto samples_for = [&](const std::string & arm_name) {
+        std::vector<sura_manipulation_actions::msg::CartesianPoseSample> samples;
+        samples.reserve(times.size());
+        for (const double t : times) {
+          const auto pose = sample_pose(t, arm_name);
+          sura_manipulation_actions::msg::CartesianPoseSample sample;
+          sample.time_from_start = t;
+          sample.pose.position.x = pose.translation().x();
+          sample.pose.position.y = pose.translation().y();
+          sample.pose.position.z = pose.translation().z();
+          const Eigen::Quaterniond q(pose.rotation());
+          sample.pose.orientation.x = q.x(); sample.pose.orientation.y = q.y();
+          sample.pose.orientation.z = q.z(); sample.pose.orientation.w = q.w();
+          samples.push_back(sample);
+        }
+        return samples;
+      };
+    if (duration <= 0.0) {throw std::runtime_error("Pose backend needs a positive trajectory duration");}
+    for (const auto & arm : {pending->arm_a, pending->arm_b}) {
+      if (!pending->use_stpik) {break;}
+      bool retryable = false;
+      feedback(pending->handle, 0.8F, "stpik_check", "Validating " + arm.name + " pose trajectory with STPIK");
+      if (!checkPoseSamples(pending, pose_endpoints_.at(arm.name), samples_for(arm.name), retryable, error)) {
+        if (canceled()) {finish(pending, false, "Pose execution canceled during STPIK");}
+        else if (retryable) {retain(pending, error + "; plan retained; retry execution");}
+        else {finish(pending, false, error);}
+        return;
+      }
+    }
+
+    feedback(pending->handle, 0.8F, "pose_setup", "Disabling automatic pose capture on pose tasks");
+    for (const auto & arm : {pending->arm_a, pending->arm_b}) {
+      auto & endpoint = pose_endpoints_.at(arm.name);
+      if (canceled()) {throw std::runtime_error("Pose execution canceled");}
+      if (!setAutoUpdate(endpoint, false, error)) {throw std::runtime_error("Cannot disable automatic pose capture: " + error);}
+      disabled.push_back(&endpoint);
+    }
+    if (!validatePending(*pending, error)) {throw std::runtime_error(error);}
+
+    // Central differences on the sampled poses give the feedforward twist in reference axes.
+    const double h = 1e-3;
+    const auto publish = [&](double elapsed, rclcpp::Time stamp) {
+        const double before = std::max(0.0, elapsed - h);
+        const double after = std::min(duration, elapsed + h);
+        for (const auto & arm : {pending->arm_a, pending->arm_b}) {
+          const auto pose = sample_pose(elapsed, arm.name);
+          geometry_msgs::msg::PoseStamped message;
+          message.header.frame_id = reference_frame;
+          message.header.stamp = stamp;
+          message.pose.position.x = pose.translation().x();
+          message.pose.position.y = pose.translation().y();
+          message.pose.position.z = pose.translation().z();
+          const Eigen::Quaterniond q(pose.rotation());
+          message.pose.orientation.x = q.x(); message.pose.orientation.y = q.y();
+          message.pose.orientation.z = q.z(); message.pose.orientation.w = q.w();
+          auto & endpoint = pose_endpoints_.at(arm.name);
+          endpoint.target->publish(message);
+
+          const auto ahead = sample_pose(after, arm.name);
+          const auto behind = sample_pose(before, arm.name);
+          const double span = after - before;
+          geometry_msgs::msg::TwistStamped twist;
+          twist.header.frame_id = reference_frame;
+          twist.header.stamp = stamp;
+          if (span > 0.0) {
+            const Eigen::Vector3d linear = (ahead.translation() - behind.translation()) / span;
+            const Eigen::AngleAxisd rotation(ahead.rotation() * behind.rotation().transpose());
+            const Eigen::Vector3d angular = rotation.axis() * rotation.angle() / span;
+            twist.twist.linear.x = linear.x(); twist.twist.linear.y = linear.y(); twist.twist.linear.z = linear.z();
+            twist.twist.angular.x = angular.x(); twist.twist.angular.y = angular.y(); twist.twist.angular.z = angular.z();
+          }
+          endpoint.feedforward->publish(twist);
+        }
+      };
+    const auto publish_zero_feedforward = [this, &pending]() {
+        for (const auto & arm : {pending->arm_a, pending->arm_b}) {
+          geometry_msgs::msg::TwistStamped zero;
+          zero.header.frame_id = context_->model()->getModelFrame();
+          zero.header.stamp = now();
+          const auto it = pose_endpoints_.find(arm.name);
+          if (it != pose_endpoints_.end() && it->second.feedforward) {it->second.feedforward->publish(zero);}
+        }
+      };
+
+    const auto start = now();
+    const auto period = std::chrono::duration<double>(1.0 / execution_options_.feedback_rate);
+    while (!canceled()) {
+      const double elapsed = (now() - start).seconds();
+      publish(std::min(elapsed, duration), now());
+      auto output = std::make_shared<Action::Feedback>();
+      output->progress = static_cast<float>(0.8 + 0.2 * (duration > 0.0 ? std::clamp(elapsed / duration, 0.0, 1.0) : 1.0));
+      output->current_stage = elapsed >= duration ? "converging_pose" : "tracking_pose";
+      output->message = "Streaming planned poses to left_pose and right_pose";
+      pending->handle->publish_feedback(output);
+      if (elapsed >= duration + execution_options_.execution_wait_margin) {break;}
+      std::this_thread::sleep_for(period);
+    }
+    publish_zero_feedforward();
+    restore();
+    if (canceled()) {finish(pending, false, "Pose execution canceled");}
+    else {finish(pending, true, "Planned poses streamed to left_pose and right_pose; auto-update restored");}
+  } catch (const std::exception & ex) {
+    restore();
+    finish(pending, false, std::string("Pose execution exception: ") + ex.what());
+  }
 }
 
 void PlanBimanualCartesianTrajectoryActionServer::executeTrigger(
@@ -657,7 +987,7 @@ void PlanBimanualCartesianTrajectoryActionServer::cleanupResources()
   cancel_timer_.reset(); action_.reset(); execute_service_.reset(); cancel_service_.reset();
   if (context_) {context_->stop();}
   managers_.clear(); clients_group_.reset(); executor_.reset(); visualization_.reset(); context_.reset(); moveit_node_.reset();
-  arms_.clear(); pairs_.clear();
+  arms_.clear(); pairs_.clear(); pose_endpoints_.clear();
   planner_options_.tightened_limits.clear(); planner_options_.nominal_positions.clear();
 }
 

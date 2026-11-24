@@ -195,7 +195,7 @@ ros2 control switch_controllers -c /cirtesub/alpha/controller/controller_manager
   --activate task_priority_controller
 ```
 
-También puedes hacerlo desde el panel de tareas. El nombre del servicio anterior corresponde al plugin de controlador del workspace; si usas el runtime independiente, consulta su namespace. La ruta del backend conjunto es `/cirtesub/controller/task_priority/tasks/bimanual_joint_trajectory/follow_joint_trajectory`, remapeada por el bringup a partir de `task_ids`.
+También puedes hacerlo desde el panel de tareas. El nombre del servicio anterior corresponde al plugin de controlador del workspace; si usas el runtime independiente, consulta su namespace. La ruta del backend conjunto es `/cirtesub/alpha/controller/task_priority/tasks/bimanual_joint_trajectory/follow_joint_trajectory`, remapeada por el bringup a partir de `task_ids`.
 
 Se envía una única trayectoria completa a esa tarea, con stamp cero: los dos brazos comparten el reloj y el avance de la misma tarea. `JointTrajectoryTask` usa el reloj monotónico existente; con simulación, su avance sigue tiempo real. No reproduce fechas futuras de ROS como los JTC. La tarea rechaza goals estando deshabilitada, y el plugin los rechaza si el controlador no está activo. Cada tarea admite un único goal simultáneo; cancelar, deshabilitar o desactivar el controlador borra la trayectoria almacenada. Reactivar no reanuda nada. `hold_last_point=true` mantiene la postura después del éxito hasta cancelar, deshabilitar, desactivar o reemplazar la trayectoria. El éxito libera el goal para admitir otro. Las tareas existentes conservan interpolación `linear` por defecto.
 
@@ -352,3 +352,18 @@ source install/setup.bash
 colcon test --packages-select sura_manipulation_actions task_priority_kinematic_control_rqt
 colcon test-result --verbose
 ```
+
+## Backend `pose` (experimental)
+
+El backend se puede elegir por goal con el campo `execution_backend` de la acción (`controller`, `task`, `pose`); vacío usa el parámetro `execution_backend` del servidor. En el panel de tareas está en la pestaña Bimanual Cartesian.
+
+Con `execution_backend:=pose` como valor por defecto, el servidor no envía la trayectoria articular a los controladores. Antes de ejecutar valida cada brazo con STPIK y después muestrea el plan (interpolación lineal de las articulaciones planificadas y cinemática directa). Las poses de la pinza se expresan en el frame del modelo, que es el world de las tareas. Cada tick publica en `<controller>/task_priority/tasks/<task_id>/target` la pose y en `.../feedforward` la velocidad lineal y angular, calculada por diferencias centrales. Al terminar o cancelar, publica velocidad cero y restaura el auto-update.
+
+Validación STPIK: se envía a `<controller>/task_priority/check_cartesian_trajectory` una muestra de la pose de cada brazo cada 10 ms (campo `samples` de la acción). Los parámetros `execution.tip_path_tolerance`, `execution.tip_goal_tolerance`, `execution.goal_time_tolerance` y `pose.stpik_timeout` son los mismos que en el planificador de un brazo. El backend no ejecuta si alguno de los dos brazos falla; si STPIK no está disponible, el plan se retiene.
+
+Parámetros por brazo (`arms.<nombre>.`): `pose_task` (por defecto `right_pose` / `left_pose` según el nombre del brazo), `pose_controller_node`, `pose_target_topic`, `pose_feedforward_topic` y `pose_stpik_action`.
+
+Limitaciones actuales:
+- Ambas tareas son igualdades: el planificador todavía no reserva una banda de tolerancia para el brazo que sujeta la red.
+- La prioridad entre `left_pose` y `right_pose` se configura en el controlador, no aquí.
+- La validación STPIK depende de que el world de las tareas coincida con el frame del modelo.

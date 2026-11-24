@@ -158,11 +158,11 @@ PlanJointTrajectoryActionServer::on_configure(const rclcpp_lifecycle::State &)
   left_task_action_ = getOrDeclareParameter(
     *this,
     "left_task_action",
-    namespacedTopic("controller/task_priority/tasks/left_joint_trajectory/follow_joint_trajectory"));
+    namespacedTopic("alpha/controller/task_priority/tasks/left_joint_trajectory/follow_joint_trajectory"));
   right_task_action_ = getOrDeclareParameter(
     *this,
     "right_task_action",
-    namespacedTopic("controller/task_priority/tasks/right_joint_trajectory/follow_joint_trajectory"));
+    namespacedTopic("alpha/controller/task_priority/tasks/right_joint_trajectory/follow_joint_trajectory"));
   execute_service_name_ = getOrDeclareParameter(
     *this,
     "execute_service_name",

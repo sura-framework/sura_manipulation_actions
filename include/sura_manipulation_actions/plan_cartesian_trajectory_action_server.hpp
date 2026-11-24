@@ -15,11 +15,14 @@
 #include "sura_manipulation_actions/action/plan_cartesian_trajectory.hpp"
 #include "sura_manipulation_actions/action/follow_cartesian_trajectory.hpp"
 #include "sura_manipulation_actions/action/check_cartesian_trajectory.hpp"
+#include "sura_manipulation_actions/action/prepare_cartesian_posture.hpp"
 #include "sura_manipulation_actions/single_arm_cartesian_planner.hpp"
 #include "sura_manipulation_actions/cartesian_moveit_context.hpp"
 #include "sura_manipulation_actions/cartesian_trajectory_visualization.hpp"
 #include "sura_manipulation_actions/trajectory_execution.hpp"
 #include "sura_manipulation_actions/cartesian_pose_path.hpp"
+#include "sura_manipulation_actions/whole_body_nominal.hpp"
+#include "sura_manipulation_actions/msg/robot_nominal_reference.hpp"
 
 namespace sura_manipulation_actions
 {
@@ -31,6 +34,7 @@ public:
   using Handle = rclcpp_action::ServerGoalHandle<Action>;
   using FollowAction = sura_manipulation_actions::action::FollowCartesianTrajectory;
   using FollowHandle = rclcpp_action::ClientGoalHandle<FollowAction>;
+  using PrepareAction = sura_manipulation_actions::action::PrepareCartesianPosture;
   using CheckAction = sura_manipulation_actions::action::CheckCartesianTrajectory;
   using CheckHandle = rclcpp_action::ClientGoalHandle<CheckAction>;
   using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
@@ -46,10 +50,13 @@ private:
   };
   struct PoseEndpoint
   {
-    std::string controller_node, task_id, target_topic, feedforward_topic, check_action;
+    std::string controller_node, task_id, target_topic, feedforward_topic, check_action, prepare_action;
+    std::string nominal_topic;
+    rclcpp_action::Client<PrepareAction>::SharedPtr preparer;
     rclcpp_action::Client<CheckAction>::SharedPtr checker;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr target;
     rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr feedforward;
+    rclcpp::Publisher<msg::RobotNominalReference>::SharedPtr nominal;
   };
   struct PendingPlan
   {
@@ -61,7 +68,15 @@ private:
     bimanual_cartesian::PlannedTrajectory plan;
     CartesianViews views;
     CartesianPosePath pose_path;
+    msg::PosturePreparationSummary proposal;
+    bool posture_applied = false;
+    // Whole-body nominal streamed to robot_nominal (optimize_trajectory_nominal).
+    bool wants_nominal = false;
+    WholeBodyNominal nominal;
+    trajectory_msgs::msg::JointTrajectory nominal_joints;
+    trajectory_msgs::msg::MultiDOFJointTrajectory nominal_base;
     Eigen::Isometry3d pose_start = Eigen::Isometry3d::Identity();
+    Eigen::Matrix<double, 6, 1> pose_activation = Eigen::Matrix<double, 6, 1>::Ones();
     Eigen::Isometry3d fixed_from_model = Eigen::Isometry3d::Identity();
     Eigen::Isometry3d base_reference = Eigen::Isometry3d::Identity();
     sura_manipulation_actions::msg::BaseMotionLimits base_limits;
@@ -84,7 +99,8 @@ private:
   void executePlan(const std::shared_ptr<PendingPlan> & pending);
   void planPoseGoal(const std::shared_ptr<PendingPlan> & pending);
   void executePosePlan(const std::shared_ptr<PendingPlan> & pending);
-  bool poseBackendReady(const PendingPlan & pending, bool & auto_update, std::string & error);
+  bool poseBackendReady(PendingPlan & pending, bool & auto_update, std::string & error);
+  bool preparePosture(PendingPlan & pending, bool apply, std::string & error);
   bool checkPoseTrajectory(const PendingPlan &, uint64_t & validation_id,
     bool & retryable, std::string & error);
   bool validatePosePending(const PendingPlan & pending, std::string & error) const;
@@ -103,7 +119,8 @@ private:
     std::shared_ptr<std_srvs::srv::Trigger::Response> response);
   void feedback(
     const std::shared_ptr<Handle> & handle, float progress,
-    const std::string & stage, const std::string & message) const;
+    const std::string & stage, const std::string & message,
+    const msg::PosturePreparationSummary * proposal = nullptr) const;
   void finish(const std::shared_ptr<PendingPlan> & pending, bool success, const std::string & message);
   void retain(const std::shared_ptr<PendingPlan> & pending, const std::string & message);
   void stop(const std::string & message);

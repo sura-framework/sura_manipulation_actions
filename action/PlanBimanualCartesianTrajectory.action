@@ -16,6 +16,10 @@ bool execute
 # These determine trajectory timing, not the planning computation budget.
 float64 velocity_scaling
 float64 acceleration_scaling
+# Execution backend: controller, task or pose. Empty uses the server's execution_backend.
+string execution_backend
+# Pose execution only: validate both arms with STPIK before streaming. Other backends ignore this.
+bool use_stpik true
 ---
 bool success
 string message

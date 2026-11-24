@@ -1,5 +1,6 @@
 """Unified manipulation action servers, with manual lifecycle/backend activation."""
 import os
+import subprocess
 import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -36,17 +37,29 @@ def _setup(context):
         ("robot_description", "robot_description_package", "robot_description_file", "xacro_arguments"),
         ("robot_description_semantic", "robot_description_semantic_package", "robot_description_semantic_file", "srdf_xacro_arguments"),
     ):
-        path = os.path.join(get_package_share_directory(arg(package)), arg(filename))
-        robot[parameter] = ParameterValue(Command([
-            FindExecutable(name="xacro"), " ", path, " ", _render(arg(arguments), namespace)]), value_type=str)
+        source_node = arg("robot_description_source_node").strip()
+        if parameter == "robot_description" and source_node:
+            node_name = "/" + source_node.strip("/")
+            document = yaml.safe_load(subprocess.check_output(
+                ["ros2", "param", "dump", node_name], text=True,
+                timeout=float(arg("robot_description_timeout")))) or {}
+            parameters = document.get(node_name, document.get(node_name.strip("/"), {}))
+            urdf = parameters.get("ros__parameters", {}).get("robot_description", "")
+            if not isinstance(urdf, str) or not urdf.strip():
+                raise RuntimeError(f"Missing robot_description on {node_name}")
+            robot[parameter] = ParameterValue(urdf, value_type=str)
+        else:
+            path = os.path.join(get_package_share_directory(arg(package)), arg(filename))
+            robot[parameter] = ParameterValue(Command([
+                FindExecutable(name="xacro"), " ", path, " ", _render(arg(arguments), namespace)]), value_type=str)
     limits = os.path.join(moveit_share, arg("joint_limits_file"))
     kinematics = os.path.join(moveit_share, arg("kinematics_file"))
     common = {"robot_namespace": namespace, "moveit_namespace": arg("moveit_namespace"),
               "use_sim_time": enabled("use_sim_time"), "execution_backend": arg("execution_backend"),
               "current_state_timeout": float(arg("current_state_timeout")),
               "planning_scene_publish_rate": float(arg("planning_scene_publish_rate"))}
-    left_task = arg("left_task_action") or f"{prefix}/controller/task_priority/tasks/left_joint_trajectory/follow_joint_trajectory"
-    right_task = arg("right_task_action") or f"{prefix}/controller/task_priority/tasks/right_joint_trajectory/follow_joint_trajectory"
+    left_task = arg("left_task_action") or f"{prefix}/alpha/controller/task_priority/tasks/left_joint_trajectory/follow_joint_trajectory"
+    right_task = arg("right_task_action") or f"{prefix}/alpha/controller/task_priority/tasks/right_joint_trajectory/follow_joint_trajectory"
     joint = dict(common, default_planning_time=float(arg("default_planning_time")),
                  default_goal_tolerance=float(arg("default_goal_tolerance")),
                  controller_wait_timeout=float(arg("controller_wait_timeout")),
@@ -112,6 +125,9 @@ def _setup(context):
         actions.append(Node(package="task_priority_kinematic_control_rqt", executable="planning_marker_server",
             name="planning_marker_server", output="screen", parameters=[marker_parameters]))
     if enabled("launch_hybrid"):
+        if arg("robot_description_source_node").strip():
+            raise RuntimeError("Remote robot_description is supported by the unified action servers; "
+                               "launch_hybrid must remain false.")
         arguments = {name: arg(name) for name in ("robot_namespace", "robot_description_package", "robot_description_file",
             "robot_description_semantic_package", "robot_description_semantic_file", "execution_backend", "use_sim_time")}
         arguments.update(xacro_arguments=_render(arg("xacro_arguments"), namespace), use_rviz="false",
@@ -145,6 +161,7 @@ def generate_launch_description():
         "default_planning_time": "5.0", "default_goal_tolerance": "0.02", "controller_wait_timeout": "5.0",
         "execution_feedback_rate": "10.0", "current_state_timeout": "2.0", "planning_scene_publish_rate": "10.0",
         "reference_frame": "", "relative_reference_frame": "", "fixed_frame": "", "joint_states_topic": "", "planning_scene_input_topic": "",
+        "robot_description_source_node": "", "robot_description_timeout": "10.0",
         "use_sim_time": "false", "use_rviz": "false", "use_rqt": "false",
         "rviz_config_file": os.path.join(share, "rviz", "manipulation_planning.rviz"),
         "launch_joint": "true", "launch_bimanual_joint": "true", "launch_cartesian": "true", "launch_bimanual_cartesian": "true", "launch_hybrid": "false",

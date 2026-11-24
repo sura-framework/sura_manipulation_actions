@@ -19,7 +19,7 @@
     arms.alpha_right.manager_service: /${robot_namespace}/alpha/controller/controller_manager/list_controllers
     pairs.dual_alpha.arms: [alpha_left, alpha_right]
     pairs.dual_alpha.group: dual_alpha
-    pairs.dual_alpha.task_action: /${robot_namespace}/controller/task_priority/tasks/bimanual_joint_trajectory/follow_joint_trajectory
+    pairs.dual_alpha.task_action: /${robot_namespace}/alpha/controller/task_priority/tasks/bimanual_joint_trajectory/follow_joint_trajectory
     pairs.dual_alpha.task_controller_name: task_priority_controller
     pairs.dual_alpha.task_manager_service: /${robot_namespace}/alpha/controller/controller_manager/list_controllers
     current_state_timeout: 2.0

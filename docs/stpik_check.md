@@ -84,7 +84,7 @@ set-based inactivas no se cuentan. El reposo dentro de tolerancias es válido.
 
 En el planificador, `pose.stpik_timeout` vale 35 s y debe cubrir worker y transporte.
 `arms.<arm>.pose_stpik_action` configura la ruta, por defecto derivada de los topics
-de la tarea. El perfil usa `/cirtesub/controller/task_priority/check_cartesian_trajectory`;
+de la tarea. El perfil usa `/cirtesub/alpha/controller/task_priority/check_cartesian_trajectory`;
 bringup remapea también sus cinco endpoints internos en Humble.
 
 ## Resultados y frescura

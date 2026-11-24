@@ -33,7 +33,7 @@ Cada brazo configura `arms.<arm>.pose_task` y
 de ese nodo y de la tarea: `task_priority/tasks/<task>/target` y `/feedforward`.
 El perfil dual Alpha conserva el nodo en
 `/cirtesub/alpha/controller/task_priority_controller`, pero el bringup remapea
-los topics a `/cirtesub/controller/task_priority/tasks/<task>/target` y
+los topics a `/cirtesub/alpha/controller/task_priority/tasks/<task>/target` y
 `/feedforward`. El YAML del planificador configura explícitamente esas rutas
 mediante `arms.<arm>.pose_target_topic` y `arms.<arm>.pose_feedforward_topic`.
 Para otra distribución de nodos o remapeos, adapta ambos parámetros.
@@ -82,6 +82,88 @@ precede a cualquier publicación o cambio en la tarea real. Consulta
 Las tolerancias de seguimiento se toman del goal, sin un límite cartesiano adicional
 en el controlador. Con `use_stpik: false` se omite el check previo y se mantiene
 la supervisión del tracking durante la ejecución.
+
+## Preparación de la postura inicial con OSQP
+
+En el backend **Pose**, marca **Optimize initial posture (OSQP)** y deja **Execute after planning**
+desmarcado para revisar la propuesta. El goal lleva `optimize_initial_posture: true` y
+`use_stpik: true`. **Send Goal** muestra la pose de la base, los objetivos articulares de los
+dos brazos, el coste inicial y el propuesto, la inclinación máxima y los márgenes mínimos.
+**Execute Pending** revalida la propuesta con el estado y la escena actuales antes de mover.
+Con ejecución inmediata, el planificador encadena las dos operaciones.
+
+La acción del controlador `task_priority/prepare_cartesian_posture` recibe en `PLAN` el perfil
+cartesiano temporizado, el efector, sus tolerancias y la escena MoveIt. OSQP propone incrementos
+locales en la base y ambos brazos, sujetos a límites articulares y a la pose inicial del efector.
+Cada candidato se comprueba simulando la preparación y el recorrido completo con la jerarquía
+STPIK. El coste suma el desplazamiento inicial, la media temporal de roll² + pitch² y las
+penalizaciones por los peores márgenes articular y de colisión. La postura medida también
+participa como candidata. Si gana, se puede iniciar el recorrido directamente.
+
+`APPLY` consume el identificador de la propuesta. Durante la preparación, la tarea de pose
+del brazo seleccionado mantiene la herramienta en su pose inicial. `base_pose` recibe XYZ
+y yaw, `stabilize` controla roll y pitch, y `left_arm_nominal` y `right_arm_nominal` reciben
+las referencias articulares. Se mantienen activas `joint_limits`, `stabilize_limits` y
+`self_collision_avoidance`. Al terminar se restauran las activaciones y se capturan referencias
+medidas antes del seguimiento cartesiano. Una cancelación durante el movimiento libera la reserva.
+
+En el controlador, `posture.budget` limita la búsqueda (30 s por defecto),
+`posture.radius` determina el incremento inicial (0,15 m o rad según la coordenada),
+y `posture.duration` y `posture.settle` fijan los tiempos de movimiento y asentamiento (6 y 4 s).
+Los pesos son `posture.movement_weight`, `posture.tilt_weight`, `posture.joint_weight` y
+`posture.clearance_weight`. Los umbrales de penalización son `posture.joint_buffer` (0,20 rad)
+y `posture.collision_buffer` (0,06 m). Los márgenes describen las muestras de la simulación
+cinemática con la escena disponible en cada validación.
+
+## Trayectoria nominal de cuerpo completo (`robot_nominal`)
+
+En el backend **Pose**, **Optimize whole trajectory (robot_nominal)** envía
+`optimize_trajectory_nominal: true` y requiere STPIK. Es excluyente con **Optimize initial
+posture**: el servidor rechaza los dos a la vez y en RQT solo se puede marcar uno. El
+controlador calcula una nominal temporizada de la base (XYZ + RPY en el frame mundo) y de los
+dos brazos sobre el perfil cartesiano. La postura inicial es su primer nudo y se optimiza
+junto con el resto; no se ejecuta la búsqueda de postura separada, que exigía un recorrido
+factible sin la nominal. Durante
+la ejecución, el planificador la publica a 100 Hz en
+`<controller>/task_priority/tasks/robot_nominal/reference`
+(`sura_manipulation_actions/msg/RobotNominalReference`), con el mismo `elapsed` que las
+referencias de la herramienta. La tarea `robot_nominal`, de prioridad baja, la sigue en
+el espacio nulo de las tareas superiores.
+
+Cálculo, en `task_priority/prepare_cartesian_posture` con `full_trajectory: true`:
+
+1. Semilla: simulación STPIK del recorrido desde la postura medida con la jerarquía real
+   (lo que haría el controlador). Si falla a mitad, por ejemplo por una colisión, se conserva
+   la parte alcanzada y el resto se proyecta sobre el perfil de la herramienta para que el
+   SQP lo repare. Dentro de una colisión se usa la distancia MoveIt con signo, de modo que
+   también hay gradiente.
+2. SQP con OSQP sobre todos los nudos (`posture.nominal.knot_dt`, como máximo
+   `posture.nominal.max_knots`). Restricciones: herramienta sobre el perfil temporizado,
+   tareas superiores linealizadas (duras por encima de la tarea de pose y blandas entre ella
+   y `robot_nominal`), límites articulares, límites de `stabilize_limits`, distancia MoveIt
+   y velocidad entre nudos (`posture.nominal.velocity_fraction` de `velocity_limits`).
+   Coste: aceleraciones, inclinación, márgenes articulares y de obstáculos. El primer nudo
+   es libre, con la herramienta en el inicio del perfil. Alejarse de la postura medida cuesta
+   `posture.movement_weight` (escalas de la búsqueda de postura) y el desplazamiento está
+   acotado por lo que cabe en `posture.duration`.
+3. Si la semilla o el SQP fallan: muestreo por capas de la variedad de automovimientos más
+   programación dinámica, refinado de nuevo con SQP (`posture.nominal.global_fallback`).
+4. Si el primer nudo cambia, se simula la recolocación (herramienta fija, `base_pose` y
+   `*_arm_nominal` llevando la postura). Si no se asienta, se reintenta con un
+   desplazamiento máximo menor y, por último, con el inicio fijo en la postura medida.
+5. Validación STPIK obligatoria del recorrido desde esa postura, con la nominal emitida a
+   `robot_nominal` exactamente como en ejecución. Si no pasa, el goal falla con el
+   diagnóstico.
+
+La propuesta (`Proposed posture` en RQT) es el primer nudo. El coste mostrado es el de la
+nominal; el de la postura medida aparece como `n/a` porque en este modo no se evalúa por
+separado. `APPLY` mueve el robot a esa postura comprobando solo la recolocación y vuelve a
+planificar la nominal desde la postura asentada, con inicio fijo y usando la anterior como
+semilla. **Execute Pending** comprueba y emite esa versión. La comprobación STPIK previa a la ejecución también recibe la nominal. El resultado
+rellena `joint_trajectory`, `base_trajectory` y `base_path`, que también se publican para RViz.
+Al terminar o abortar se emite una última referencia en reposo. Las tareas de `sync_tasks`
+(`base_pose`, `*_arm_nominal`) conservan esa referencia, así que no devuelven el robot a la
+postura anterior.
 
 ## Planificación con trayectorias de base y articulaciones
 
@@ -183,7 +265,7 @@ Antes de ejecutar se revalidan base, articulaciones y escena. Un plan obsoleto
 exige otro goal; la preparación del backend no inicia el plan por sí sola.
 
 El backend task envía una solicitud `FollowCartesianTrajectory` a
-`/cirtesub/controller/task_priority/follow_cartesian_trajectory`. El controlador
+`/cirtesub/alpha/controller/task_priority/follow_cartesian_trajectory`. El controlador
 reserva los recursos e instala ambas trayectorias con un sello inicial común y
 un único reloj ROS. Pausar el tiempo de simulación pausa su progreso.
 
@@ -196,7 +278,7 @@ El éxito mantiene el final, incluida la inclinación. Cancelar o fallar detiene
 las referencias y mantiene el estado medido. Para volver a las tareas anteriores:
 
 ```bash
-ros2 service call /cirtesub/controller/task_priority/release_cartesian_trajectory std_srvs/srv/Trigger '{}'
+ros2 service call /cirtesub/alpha/controller/task_priority/release_cartesian_trajectory std_srvs/srv/Trigger '{}'
 ```
 
 Los objetivos de mantenimiento se actualizan al estado medido; la estabilización

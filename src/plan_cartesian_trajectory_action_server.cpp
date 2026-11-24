@@ -117,7 +117,7 @@ bool PlanCartesianTrajectoryActionServer::loadConfiguration(std::string & error)
     reference_frame_.empty() ? "world_ned" : reference_frame_);
   base_frame_ = parameter<std::string>(*this, "base_frame", topic("base_link").substr(1));
   coordinated_action_ = parameter<std::string>(*this, "execution.coordinated_action",
-    topic("controller/task_priority/follow_cartesian_trajectory"));
+    topic("alpha/controller/task_priority/follow_cartesian_trajectory"));
   base_manager_service_ = parameter<std::string>(*this, "execution.base_manager_service",
     topic("controller/controller_manager/list_controllers"));
   base_controller_name_ = parameter<std::string>(*this, "execution.base_controller_name", "body_velocity");
@@ -258,6 +258,12 @@ bool PlanCartesianTrajectoryActionServer::loadConfiguration(std::string & error)
     pose.check_action = parameter<std::string>(*this, prefix + "pose_stpik_action",
       (tasks_separator == std::string::npos ? pose_namespace + "/task_priority" :
       pose.target_topic.substr(0, tasks_separator)) + "/check_cartesian_trajectory");
+    pose.prepare_action = parameter<std::string>(*this, prefix + "pose_prepare_action",
+      pose.check_action.substr(0, pose.check_action.rfind('/') + 1) + "prepare_cartesian_posture");
+    pose.nominal_topic = parameter<std::string>(*this, prefix + "pose_nominal_topic",
+      (tasks_separator == std::string::npos ? pose_namespace + "/task_priority" :
+      pose.target_topic.substr(0, tasks_separator)) + "/tasks/" +
+      parameter<std::string>(*this, prefix + "pose_nominal_task", "robot_nominal") + "/reference");
     if (pose.controller_node.empty() || pose.task_id.empty() || pose.target_topic.empty() || pose.feedforward_topic.empty()) {
       error = "Pose task endpoints cannot be empty: " + name; return false;
     }
@@ -295,11 +301,14 @@ PlanCartesianTrajectoryActionServer::on_configure(const rclcpp_lifecycle::State 
     pose_tf_buffer_ = std::make_unique<tf2_ros::Buffer>(moveit_node_->get_clock());
     pose_tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*pose_tf_buffer_, moveit_node_, false);
     for (auto & entry : pose_endpoints_) {
+      entry.second.preparer = rclcpp_action::create_client<PrepareAction>(moveit_node_, entry.second.prepare_action);
       entry.second.checker = rclcpp_action::create_client<CheckAction>(moveit_node_, entry.second.check_action);
       entry.second.target = moveit_node_->create_publisher<geometry_msgs::msg::PoseStamped>(
         entry.second.target_topic, rclcpp::QoS(1).reliable());
       entry.second.feedforward = moveit_node_->create_publisher<geometry_msgs::msg::TwistStamped>(
         entry.second.feedforward_topic, rclcpp::QoS(1).reliable());
+      entry.second.nominal = moveit_node_->create_publisher<msg::RobotNominalReference>(
+        entry.second.nominal_topic, rclcpp::QoS(1).reliable());
     }
     const auto & model = context_->model();
     if (reference_frame_ != model->getModelFrame()) {
@@ -415,6 +424,17 @@ bool PlanCartesianTrajectoryActionServer::validateGoal(
   if (pending.backend != "controller" && pending.backend != "task" && pending.backend != "pose") {
     error = "execution_backend must be empty, controller, task or pose"; return false;
   }
+  if (goal.optimize_initial_posture && (pending.backend != "pose" || !goal.use_stpik)) {
+    error = "Initial posture optimization requires the pose backend and STPIK"; return false;
+  }
+  if (goal.optimize_trajectory_nominal && (pending.backend != "pose" || !goal.use_stpik)) {
+    error = "Whole-trajectory nominal optimization requires the pose backend and STPIK"; return false;
+  }
+  if (goal.optimize_trajectory_nominal && goal.optimize_initial_posture) {
+    error = "Choose either optimize_initial_posture or optimize_trajectory_nominal; "
+      "the whole-trajectory optimization already optimizes the initial posture"; return false;
+  }
+  pending.wants_nominal = goal.optimize_trajectory_nominal;
   for (const auto scaling : {goal.velocity_scaling, goal.acceleration_scaling}) {
     if (!std::isfinite(scaling) || scaling < 0.0 || scaling > 1.0) {
       error = "velocity_scaling and acceleration_scaling must be finite in [0, 1]; zero uses server defaults";
@@ -946,10 +966,12 @@ void PlanCartesianTrajectoryActionServer::cancelTrigger(
 
 void PlanCartesianTrajectoryActionServer::feedback(
   const std::shared_ptr<Handle> & handle, float progress,
-  const std::string & stage, const std::string & message) const
+  const std::string & stage, const std::string & message,
+  const msg::PosturePreparationSummary * proposal) const
 {
   if (!handle || !handle->is_active()) {return;}
   auto feedback = std::make_shared<Action::Feedback>();
+  if (proposal) {feedback->proposal = *proposal;}
   feedback->progress = progress; feedback->current_stage = stage; feedback->message = message;
   try {
     handle->publish_feedback(feedback);
@@ -962,7 +984,7 @@ void PlanCartesianTrajectoryActionServer::retain(
   const std::shared_ptr<PendingPlan> & pending, const std::string & message)
 {
   {std::lock_guard<std::mutex> lock(mutex_); if (pending_ != pending) {return;} stage_ = Stage::Pending;}
-  feedback(pending->handle, 0.8F, "waiting_for_execute", message);
+  feedback(pending->handle, 0.8F, "waiting_for_execute", message, &pending->proposal);
 }
 
 void PlanCartesianTrajectoryActionServer::finish(
@@ -970,6 +992,7 @@ void PlanCartesianTrajectoryActionServer::finish(
 {
   if (pending->finished.exchange(true)) {return;}
   auto result = std::make_shared<Action::Result>();
+  result->proposal = pending->proposal;
   result->success = success;
   result->message = message;
   result->joint_trajectory = pending->plan.joint_trajectory;

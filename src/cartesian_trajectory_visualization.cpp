@@ -327,4 +327,31 @@ CartesianViews CartesianTrajectoryVisualization::publishPosePath(const nav_msgs:
   return views;
 }
 
+void CartesianTrajectoryVisualization::publishPoseNominal(
+  const trajectory_msgs::msg::JointTrajectory & joints,
+  const trajectory_msgs::msg::MultiDOFJointTrajectory & base, CartesianViews & views)
+{
+  views.base_path = nav_msgs::msg::Path();
+  views.base_path.header.frame_id = base.header.frame_id;
+  views.base_path.header.stamp = rclcpp::Time(0, 0, node_->get_clock()->get_clock_type());
+  for (const auto & point : base.points) {
+    if (point.transforms.empty()) {continue;}
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header = views.base_path.header;
+    const auto & transform = point.transforms.front();
+    pose.pose.position.x = transform.translation.x;
+    pose.pose.position.y = transform.translation.y;
+    pose.pose.position.z = transform.translation.z;
+    pose.pose.orientation = transform.rotation;
+    views.base_path.poses.push_back(pose);
+  }
+  joint_pub_->publish(joints);
+  if (base_trajectory_pub_) {base_trajectory_pub_->publish(base);}
+  if (publish_paths_) {
+    std::lock_guard<std::mutex> lock(path_cache_->mutex);
+    path_cache_->views.base_path = views.base_path;
+    if (base_path_pub_) {base_path_pub_->publish(views.base_path);}
+  }
+}
+
 }  // namespace sura_manipulation_actions
