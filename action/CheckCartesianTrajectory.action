@@ -16,6 +16,15 @@ CartesianPoseSample[] samples
 # during the simulation, exactly as the Pose executor streams it at runtime.
 trajectory_msgs/JointTrajectory nominal_joints
 trajectory_msgs/MultiDOFJointTrajectory nominal_base
+LocalPrediction prediction
+# Non-empty points select the facing check: task_id is an EndEffectorsFacingTask,
+# nominal_joints/nominal_base are streamed to robot_nominal with nominal_activation (as the
+# facing executor does) and nominal_progress gives the progress of each of their points.
+# path/goal tolerances then follow the facing rows [left pointing(2), right pointing(2),
+# roll, distance]; trajectory, samples, tip_frame and tolerance_orientation are ignored.
+FacingPath facing_path
+float64[] nominal_progress
+bool[] nominal_activation
 ---
 uint8 SUCCESS=0
 uint8 FAIL=1
@@ -37,7 +46,18 @@ float64 minimum_clearance
 float64 maximum_velocity_ratio
 float64 minimum_singular_value
 uint64 validation_id
+LocalSegment segment
+float64 continuation_cost
+float64 segment_cost
+float64 configuration_error
+uint32 hierarchy_rank
+string[] active_constraints
+uint32 candidates
+PredictionSample[] trace
+LocalCandidatePath[] explored_paths
+float64 compute_seconds
 ---
+
 float32 progress
 float64 time_from_start
 string message

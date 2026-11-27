@@ -18,7 +18,7 @@ struct CartesianViews
 {
   nav_msgs::msg::Path arm_a_path;
   nav_msgs::msg::Path arm_b_path;
-  nav_msgs::msg::Path relative_path;
+  // Single-arm desired Cartesian path.
   nav_msgs::msg::Path desired_relative_path;
   nav_msgs::msg::Path base_path;
 };
@@ -64,7 +64,7 @@ private:
   rclcpp::Publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr base_trajectory_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr base_path_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr arm_a_pub_, arm_b_pub_;
-  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr relative_pub_, desired_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr desired_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
   std::shared_ptr<PathCache> path_cache_;
   rclcpp::TimerBase::SharedPtr path_refresh_timer_;

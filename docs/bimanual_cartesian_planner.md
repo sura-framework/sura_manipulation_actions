@@ -1,6 +1,13 @@
-# Planificación cartesiana bimanual
+# Planificación bimanual de *facing*
 
-`PlanBimanualCartesianTrajectory` calcula una trayectoria articular conjunta para alcanzar la separación y orientación relativas entre los brazos A y B. Ambos participan sin prioridad por brazo; `planning.weights` permite penalizar individualmente el movimiento de cada articulación. La salida ejecutable es `trajectory_msgs/JointTrajectory`; los `nav_msgs/Path` sirven para representar el resultado. No activa tareas ni cambia controladores.
+`PlanBimanualCartesianTrajectory` planifica una trayectoria articular conjunta en la que las dos herramientas se encaran: cada una apunta hacia la otra a lo largo de la línea que las une, con un roll relativo y una distancia pedidos. Solo se mueven las articulaciones de los brazos; la base queda fija. No usa planner local. De cada plan salen dos referencias ligadas por el progreso geométrico `s ∈ [0,1]`:
+
+| Prioridad | Referencia | Destino (backend `facing`) |
+| --- | --- | --- |
+| Primaria | `facing_path`: referencia de facing en función de `s`, sin tiempos | `EndEffectors_Facing` |
+| Secundaria | `joint_trajectory` temporizada, con `nominal_progress` por punto | `robot_nominal`, solo brazos |
+
+La acción planifica por defecto sin ejecutar; no activa tareas ni cambia controladores.
 
 ## Lanzamiento y lifecycle
 
@@ -26,41 +33,39 @@ La acción por defecto es `/cirtesub/manipulation/plan_bimanual_cartesian_trajec
 
 | Campo | Significado |
 | --- | --- |
-| `arm_a`, `arm_b` | Identificadores exactos de `arm_names`; se pueden intercambiar. |
-| `relative_target` | Separación y rotación relativas expresadas en los ejes de `relative_reference_frame` (base); `header.frame_id` debe coincidir con ese frame y el quaternion debe ser unitario. |
-| `relative_position_tolerance` | Tolerancia independiente en X/Y/Z del marco de referencia (base), en metros. |
-| `relative_orientation_tolerance` | Tolerancia independiente del vector logaritmo de SO(3), en radianes, respecto a la orientación relativa deseada. |
-| `cartesian_step`, `planning_time` | Resolución lineal y presupuesto temporal. Valores no positivos usan los defaults del YAML. |
-| `velocity_scaling`, `acceleration_scaling` | Factores de límites articulares en `(0, 1]`; cero usa el valor correspondiente del YAML. Valores negativos, superiores a 1 o no finitos se rechazan. |
-| `execute` | `false`: publicar y esperar el servicio de ejecución; `true`: intentar ejecutar después de planificar. |
+| `left_pointing_axis`, `right_pointing_axis` | Eje puro con signo (±x, ±y, ±z) de cada herramienta, en su propio frame, que apunta a la otra. |
+| `roll_angle` | Roll relativo alrededor de la línea izquierda → derecha [rad]. `NaN` mantiene el medido. |
+| `distance` | Distancia entre herramientas [m], no menor que `planning.facing_min_distance`. |
+| `pointing_tolerance` | Ángulo admitido entre cada eje y su referencia [rad], en todo el recorrido. |
+| `roll_tolerance`, `distance_tolerance` | Tolerancias de roll [rad] y distancia [m]. Cero es estricto (`1e-6`). |
+| `cartesian_step`, `planning_time` | Resolución lineal y presupuesto temporal. Valores no positivos usan el YAML. |
+| `velocity_scaling`, `acceleration_scaling` | Factores de límites articulares en `(0, 1]`; cero usa el YAML. |
+| `execute` | `false`: publicar y esperar el servicio de ejecución. |
+| `execution_backend` | `controller`, `task` o `facing`; vacío usa el parámetro del servidor. |
+| `use_stpik` | Solo backend `facing`: simular con STPIK antes de ejecutar. |
 
-Las tolerancias relativas cero son restricciones estrictas, con las precisiones numéricas configuradas (`1e-6 m` y `1e-6 rad` por defecto). El primer punto articular conserva exactamente la configuración medida; no se corrige una postura inicial fuera de límites o en colisión. Ningún brazo queda fijado por el orden A/B.
+El goal no elige brazos: son `pairs.<active_pair>.arms`, en orden `[izquierdo, derecho]`; `active_pair` es por defecto el primero de `pair_names`.
 
-La velocidad se selecciona antes de planificar mediante `velocity_scaling` y
-`acceleration_scaling`. Por ejemplo, `0.05` limita al 5 % de los máximos cargados
-de cada articulación. Son factores independientes; cero conserva el default
-correspondiente, actualmente `0.1` en el YAML Alpha. Se aplican a la temporización
-y a la validación final, y quedan guardados con el plan pendiente para comprobar
-la ejecución con los mismos límites. Los dos backends reciben los tiempos y
-derivadas resultantes. Para cambiar la velocidad de un plan pendiente, envía
-un goal nuevo. `planning_time` limita el cálculo, no la duración del movimiento.
+El cero del roll usa un eje de referencia cíclico de cada herramienta, con el signo de su eje de apuntado: ±x → ±y, ±y → ±z, ±z → ±x. El roll es el ángulo con signo, alrededor de la línea, desde la referencia izquierda hasta la derecha, ambas proyectadas en el plano normal. Es la misma geometría que usa `EndEffectorsFacingTask` (`facing_geometry.hpp`).
 
-Sean `p_A`, `R_A` y `p_B`, `R_B` las poses de las pinzas expresadas en la base.
-El objetivo contiene `Δp = p_B - p_A` y `ΔR = R_B · R_Aᵀ`: son la separación
-y la diferencia de orientación en los ejes de la base, no la posición absoluta
-del brazo B ni `T_A⁻¹ · T_B`. Aumentar X en `0.01` pide un centímetro más de
-separación sobre X de la base aunque gire el brazo A. La orientación identidad
-pide pinzas con igual orientación. El error angular es `log(ΔR_obj · ΔR_actualᵀ)`
-y sus tolerancias por componente se expresan en los ejes de la base.
-Al intercambiar A y B, la separación cambia de signo y la rotación relativa
-se invierte; el frame de referencia permanece igual.
+La referencia empieza en la geometría medida, así que el robot no necesita estar encarado: distancia y roll (arco corto) se interpolan linealmente y el eje de apuntado de cada herramienta recorre el arco corto desde su dirección actual hacia la otra herramienta hasta el eje pedido. Se rechazan el estado inicial con herramientas a menos de la distancia mínima, con roll indefinido (un eje de referencia paralelo a la línea) o con una herramienta apuntando exactamente en sentido contrario, y cualquier recorrido en el que la geometría deje de estar definida. El primer punto articular conserva la configuración medida.
 
-`relative_reference_frame` debe ser un link del modelo que no se mueva con
-ninguna de las articulaciones comandadas. Se fija a su pose medida al comenzar
-el cálculo. Vacío selecciona el frame del modelo. El ejemplo Alpha configura
-`cirtesub/base_link`.
+**Primero dirección y roll, después distancia.** Con `a` en `[0, 1)`, tomado del campo `facing_orientation_fraction` del goal o, si es negativo (el valor por defecto del goal), de `planning.facing_orientation_fraction` (0.4 por defecto), el camino tiene dos tramos: hasta `s = a` los ejes de apuntado y el roll llegan al objetivo manteniendo la distancia medida; después solo cambia la distancia. Cada tramo arranca y termina suave y hay un nudo exacto en `s = a`. Si el cambio angular es menor que `planning.angular_step` (0.05 rad) o el de distancia menor que 2 mm, no hay tramos. Con `a = 0` todo cambia a la vez. Se aplica al planner punto a punto y al modo optimizado, y si la búsqueda punto a punto falla, el mensaje indica el tramo (orientación o distancia). `facing_path` contiene los nudos del camino y `nominal_progress` sitúa cada punto de la trayectoria en él.
 
-La referencia relativa interpola linealmente la posición y usa SLERP para la orientación, también cuando solo cambia la orientación. Los pasos por defecto son `0.005 m` y `0.05 rad`. Las tolerancias se aplican durante todo el recorrido relativo. La referencia define un camino geométrico; no exige avance uniforme en tiempo. Al validar cada segmento se proyecta la pose relativa sobre ese tramo de la recta (o del arco SLERP en orientación pura), se acota el progreso a sus endpoints y se comprueban todas las componentes respecto a esa referencia.
+La velocidad se elige antes de planificar; para cambiarla en un plan pendiente, envía un goal nuevo. `planning_time` limita el cálculo, no la duración del movimiento.
+
+`relative_reference_frame` (en Alpha `cirtesub/base_link`) debe ser un link que no se mueva con las articulaciones comandadas; en él se expresan paths y markers.
+
+## Optimización de toda la trayectoria (`optimize_trajectory_nominal`)
+
+Con este campo (casilla **Optimize whole trajectory (robot_nominal)** en RQT) el plan no lo calcula el IK punto a punto del servidor, sino el mismo planificador global que usa el modo de un brazo con `robot_nominal`, dentro del controlador (`task_priority/prepare_cartesian_posture`):
+
+1. El servidor construye el `facing_path` desde el estado medido y estima una duración con `facing.max_linear_velocity` (0.3 m/s) y `facing.max_angular_velocity` (1.0 rad/s) multiplicadas por `velocity_scaling`. El progreso sigue un perfil quíntico de reposo a reposo.
+2. El controlador siembra la trayectoria proyectando cada nudo sobre el camino de facing, la optimiza entera (SQP) con toda la jerarquía (tareas por encima de facing como restricciones, las intermedias como coste, límites, inclinación, colisiones de la escena MoveIt y velocidades) y, si falla, recurre a la búsqueda por capas con programación dinámica. Valida el resultado con STPIK.
+3. La base no se planifica: la máscara de `robot_nominal` anula sus filas y el optimizador congela esas coordenadas. La postura inicial es siempre la medida.
+4. Si el plan se rechaza por velocidad, el servidor reintenta con el doble de duración, hasta tres veces.
+
+Requisitos: backend `facing`. Para planificar no hace falta tocar las tareas del controlador: sobre una copia aislada se suponen habilitadas la tarea de facing y `robot_nominal` (colocada justo debajo de facing si estaba por encima) y deshabilitadas las de `pairs.<nombre>.disabled_tasks`; el controlador en marcha no cambia y los brazos no se mueven. La jerarquía del backend `facing` (abajo) sigue siendo obligatoria para ejecutar. Las tolerancias son las de ejecución (`execution.facing_path_tolerance` y `execution.facing_goal_tolerance`); el optimizador mantiene cada fila en un cuarto de la de camino. Las tolerancias del goal no se usan en este modo. La revalidación antes de ejecutar comprueba el estado inicial y repite STPIK si `use_stpik` está activo. `facing.prepare_timeout` (120 s) limita la espera.
 
 ## Pesos articulares
 
@@ -71,13 +76,14 @@ solo esta penalización adicional; no bloquea la articulación. Los costes gener
 de continuidad, postura nominal y suavizado siguen aplicándose.
 
 ```yaml
-# Orden: alpha_left axis_b,c,d,e; alpha_right axis_b,c,d,e
-planning.weights: [0.0, 0.0, 0.0, 1.57, 0.0, 0.0, 0.0, 1.57]
+# Orden: alpha_left axis_e,d,c,b; alpha_right axis_e,d,c,b
+planning.weights: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 ```
 
-Este ejemplo penaliza especialmente `axis_e` de ambos brazos. Los pesos se
-asocian al orden de variables activas del grupo MoveIt conjunto, no al orden A/B
-del goal ni a `planning.limit_joint_names`. En Alpha son las ocho articulaciones
+La configuración Alpha usa cero en todas: el facing necesita casi todos los grados
+de libertad. Para penalizar una articulación, sube su posición. Los pesos se
+asocian al orden de variables activas del grupo MoveIt conjunto, no a
+`planning.limit_joint_names`. En Alpha son las ocho articulaciones
 indicadas arriba. Al configurar se registra cada índice, nombre y peso para
 comprobar la correspondencia con el modelo cargado.
 
@@ -89,30 +95,23 @@ Los pesos se conservan con el plan pendiente. Para modificarlos, edita el YAML,
 reinicia el servidor para cargarlo y realiza `configure` otra vez. También puedes
 hacer `cleanup`, actualizar el parámetro `planning.weights` y hacer `configure`;
 `cleanup` descarta cualquier plan pendiente. Los goals nuevos usarán los pesos
-cargados; intercambiar A/B conserva el peso de cada articulación física.
+cargados.
 
-La interfaz usa `arm_a`/`arm_b` y devuelve `arm_a_path`/`arm_b_path`; los clientes
-anteriores deben actualizarse y regenerar los mensajes de la acción.
+Los clientes de la interfaz relativa anterior deben actualizarse y regenerar los
+mensajes de la acción.
 
 ## Ejemplo Alpha y plan pendiente
 
-Los efectores del ejemplo son `cirtesub/alpha_left/standard_jaws_tool` y
-`cirtesub/alpha_right/standard_jaws_tool`, tanto en el planificador como en el
-cliente de ejemplo. El `frame_id` del objetivo es `cirtesub/base_link` para
-ambos órdenes A/B.
-
-El cliente de ejemplo obtiene ambas poses por TF en la base, con el mismo timestamp, y calcula su separación y rotación relativas. Sin desplazamiento comprueba el flujo con la relación actual; puede fallar si el robot ya está fuera de límites o en colisión. Un desplazamiento opcional se expresa sobre X de la base y su viabilidad depende de la postura. `--reference-frame` permite otro marco que coincida con la configuración del servidor.
+Los efectores son `cirtesub/alpha_left/standard_jaws_tool` y `cirtesub/alpha_right/standard_jaws_tool`. El cliente de ejemplo toma por defecto la distancia actual de TF y mantiene el roll:
 
 ```bash
 ros2 run sura_manipulation_actions plan_bimanual_cartesian_example.py
-# Proponer 1 cm sobre X de la base:
-ros2 run sura_manipulation_actions plan_bimanual_cartesian_example.py --relative-dx 0.01
-# Planificar con límites de velocidad y aceleración al 5 %:
+# Encararse 2 cm más cerca, al 5 % de velocidad y aceleración:
 ros2 run sura_manipulation_actions plan_bimanual_cartesian_example.py \
-  --relative-dx 0.01 --velocity-scaling 0.05 --acceleration-scaling 0.05
-# Intercambiar A y B:
+  --delta -0.02 --velocity-scaling 0.05 --acceleration-scaling 0.05
+# Distancia, roll y ejes explícitos:
 ros2 run sura_manipulation_actions plan_bimanual_cartesian_example.py \
-  --arm-a alpha_right --arm-b alpha_left
+  --distance 0.30 --roll 0.0 --left-axis=+x --right-axis=+x
 ```
 
 El feedback pasa a `waiting_for_execute` después de publicar el plan. El goal sigue abierto hasta ejecutar, cancelar o reemplazar el plan; la trayectoria ya puede consultarse en su tópico y en RViz. Desde otra terminal:
@@ -126,17 +125,11 @@ ros2 service call \
   std_srvs/srv/Trigger '{}'
 ```
 
-La respuesta positiva del servicio de ejecución confirma que se solicitó el intento; el feedback y el resultado de la acción informan de la ejecución real. Si el backend está desactivado o no disponible, el plan permanece pendiente. Activar el backend no ejecuta nada: hay que llamar otra vez al servicio. `--execute` hace el intento inicial automáticamente tras planificar, con la misma política de activación manual.
+La respuesta positiva del servicio de ejecución confirma que se solicitó el intento; el feedback y el resultado de la acción informan de la ejecución real. Si el backend está desactivado o no disponible, el plan permanece pendiente. Activar el backend no ejecuta nada: hay que llamar otra vez al servicio. `--execute` del ejemplo hace el intento inicial automáticamente tras planificar, con la misma política de activación manual.
 
 Antes de despachar se comprueban nuevamente el estado inicial, la base y la escena. Los defaults admiten `0.001 rad` en joints revolute, `0.0001 m` en prismatic y desplazamientos de base de `0.005 m / 0.01 rad`. También se revalida la curva completa con las posiciones actuales de las articulaciones no comandadas y los obstáculos actuales. Un plan que ya no cumple estas condiciones se rechaza y exige nueva planificación. Cancelar una ejecución, un rechazo parcial o un fallo después del despacho cancela todos sus goals, incluidas las aceptaciones tardías.
 
-La coherencia de las referencias guardadas se comprueba contra el estado inicial
-del propio plan. La comprobación de la curva usa la pose actual de la base y el
-frame de referencia actual, conservando el inicio del camino relativo original.
-Así, una variación de base dentro de las tolerancias de ejecución no provoca por
-sí sola `Stored plan pose references no longer match its initial state or goal`;
-las restricciones cartesianas y las colisiones siguen comprobándose en la escena
-actual.
+La coherencia de las referencias guardadas se comprueba contra el estado inicial del propio plan. El facing depende solo de la geometría entre herramientas, por lo que una deriva de base dentro de las tolerancias no cambia la referencia; colisiones y tolerancias se comprueban en la escena actual.
 
 ## Activación manual de los backends
 
@@ -249,83 +242,21 @@ El launch expande `${robot_namespace}` en los valores del YAML del planificador.
 
 ## RViz y salidas
 
-`rviz/bimanual_cartesian_planning.rviz` incluye la escena MoveIt y la animación del robot completo. Con el frame fijo `world_ned`, utiliza:
-
 | Tópico por defecto | Tipo |
 | --- | --- |
 | `/cirtesub/moveit/monitored_planning_scene` | `moveit_msgs/PlanningScene` |
-| `/cirtesub/moveit/display_planned_path` | `moveit_msgs/DisplayTrajectory` con estado inicial y trayectoria completa |
-| `/cirtesub/bimanual_planner/joint_trajectory` | `trajectory_msgs/JointTrajectory`, salida principal |
-| `/cirtesub/bimanual_planner/arm_a_path`, `arm_b_path` | `nav_msgs/Path` alcanzados por FK, expresados en la base/referencia |
-| `/cirtesub/bimanual_planner/relative_path`, `desired_relative_path` | `nav_msgs/Path` relativo alcanzado y deseado, dibujados con offset del brazo A inicial en la base |
-| `/cirtesub/manipulation/markers` | Un único `visualization_msgs/MarkerArray` por plan con ejes del objetivo y de las poses finales y líneas de los brazos A/B, relativo planificado y deseado |
+| `/cirtesub/moveit/display_planned_path` | `moveit_msgs/DisplayTrajectory` |
+| `/cirtesub/bimanual_planner/joint_trajectory` | `trajectory_msgs/JointTrajectory` |
+| `/cirtesub/bimanual_planner/arm_a_path`, `arm_b_path` | `nav_msgs/Path` de las herramientas izquierda y derecha |
+| `/cirtesub/manipulation/markers` | `visualization_msgs/MarkerArray` del último plan |
 
-Las acciones individual y bimanual comparten ese tópico y el mismo
-estilo. El path planificado es verde y el deseado violeta; en bimanual son
-los paths relativos, con el offset explicado abajo. También aparecen el
-brazo A cian y el brazo B naranja. La línea deseada es más ancha y translúcida
-para distinguirla cuando coincide con la planificada. Las poses muestran
-X rojo, Y verde y Z azul: objetivo con ejes de 6 cm, poses finales con ejes
-de 4 cm. No se publica la antigua flecha amarilla del objetivo individual.
+El resultado de la acción lleva `joint_trajectory`, `nominal_progress`, `facing_path`, `left_path` y `right_path`. Los markers (namespaces `bimanual_cartesian/...`) muestran los paths de ambas herramientas, la línea final entre ellas (`facing_line`), los ejes de apuntado finales (`facing_axes`) y las poses finales. Usan `relative_reference_frame`, son `frame_locked` y comparten el publicador `manipulation_marker_visualization` con las demás acciones: un plan nuevo sustituye al anterior. Los paths llevan timestamp cero y se refrescan a 10 Hz.
 
-RViz usa un único display `MarkerArray` para ese tópico común. El publicador
-común envía todas las capas habilitadas del último plan juntas en un solo mensaje
-retenido mediante `transient_local`. Los namespaces
-`bimanual_cartesian/arm_a_path`, `arm_b_path`, `planned_path`, `desired_path`,
-`target`, `arm_a_final` y `arm_b_final` permiten ocultar
-capas. La acción individual usa `cartesian/...`. Un plan nuevo sustituye
-la visualización anterior, aunque sea de otra acción. El nodo común
-`manipulation_marker_visualization` recibe las instantáneas completas en
-`/cirtesub/manipulation/marker_plans` y es el único publicador del tópico RViz.
-Publica `DELETEALL` seguido del nuevo plan en el mismo mensaje, usando un
-namespace vacío para el borrado global e ID reservado, con parejas namespace/ID
-únicas. La salida
-`transient_local`, profundidad 1, permite abrir RViz después y recibir solo
-el plan más reciente.
-Los mensajes `nav_msgs/Path` conservan sus tópicos individuales para no mezclar
-los datos de distintos planes en el refresco.
-
-La trayectoria, paths, markers y `DisplayTrajectory` usan QoS fiable `transient_local`.
-Todos los paths y markers se expresan en el frame existente `relative_reference_frame`
-(`cirtesub/base_link` en Alpha). La acción no crea frames ni publica TF adicionales.
-Los paths alcanzados salen de la FK de los waypoints finales temporizados.
-
-Para mantener el dibujo junto a los brazos, los paths relativos llevan la posición
-inicial del brazo A como offset numérico en ese frame:
-`p_dibujo = p_A_inicial + Δp`. Sus orientaciones siguen representando `ΔR`,
-no la orientación absoluta de la pinza. Para recuperar la separación a partir
-del Path, resta la posición inicial del brazo A expresada en la base. El goal
-`relative_target` conserva sus valores `Δp` y `ΔR`, sin ese offset de dibujo.
-El marker del objetivo muestra la pose del brazo B que satisfaría esa relación
-manteniendo la pose inicial del brazo A; si el brazo A se mueve, puede diferir de la
-pose final real.
-
-Los paths llevan timestamp cero y se refrescan a 10 Hz para que RViz use el TF
-más reciente incluso con `world_ned` como frame fijo. Los markers tienen
-`frame_locked=true`. Si la base se desplaza o gira, la representación acompaña
-a la base; mover la pinza A no desplaza el origen del dibujo. Se requiere
-el TF existente entre la base y el frame fijo de RViz. Cada nuevo plan limpia
-todos los markers anteriores antes de añadir los suyos, dentro del mismo mensaje.
-Las líneas comunes también son frame-locked y no necesitan el
-refresco periódico para seguir a la base. El refresco de los `nav_msgs/Path`
-solo publica paths: no vuelve a planificar
-ni envía trayectorias articulares para ejecutar.
-
-Los launches común y cartesiano arrancan el publicador de visualización
-automáticamente. Mantén uno por robot; `launch_marker_visualization:=false`
-permite reutilizar uno existente. La entrada es volátil: el nodo debe estar
-activo al publicar el plan; si se reinicia solo ese nodo, publica un nuevo plan.
-Reabrir RViz no requiere nueva planificación mientras el nodo permanece activo.
-
-La planificación sigue suponiendo la base fija. Antes de ejecutar se comprueba
-el movimiento de la base y la escena; superar las tolerancias configuradas
-invalida el plan y requiere uno nuevo. Que el dibujo acompañe a la base no
-revalida la trayectoria respecto a obstáculos del mundo. La escena recibe
-actualizaciones en `/cirtesub/moveit/planning_scene`.
+Los marcadores interactivos del panel RQT definen distancia y roll arrastrando las herramientas; el apuntado se mantiene siempre encarado.
 
 ## Método y resolución de validación
 
-Los módulos separan contexto de modelo/escena, planificación, visualización y transporte; la temporización tiene su módulo propio y el planificador valida los segmentos geométricos. La optimización secuencial usa Eigen y OSQP (`osqp_vendor`), FK y jacobianos de MoveIt, transformados desde el marco de cada cadena al marco común del modelo. Minimiza error relativo, cambios entre waypoints, movimiento articular ponderado respecto al inicio y distancia a la postura nominal. Los pesos no sustituyen la aceptación por límites articulares, tolerancias relativas y colisiones.
+Las seis filas son: apuntado izquierdo (2), apuntado derecho (2), roll y distancia. Las angulares usan `planning.orientation_weight` y la distancia `planning.position_weight`. Los módulos separan contexto de modelo/escena, planificación, visualización y transporte; la temporización tiene su módulo propio y el planificador valida los segmentos geométricos. La optimización secuencial usa Eigen y OSQP (`osqp_vendor`), FK y jacobianos de MoveIt, transformados desde el marco de cada cadena al marco común del modelo. Minimiza error de facing, cambios entre waypoints, movimiento articular ponderado respecto al inicio y distancia a la postura nominal. Los pesos no sustituyen la aceptación por límites articulares, tolerancias de facing y colisiones.
 
 Se usa la solución anterior como semilla, hasta 100 iteraciones, ocho semillas locales deterministas y seis niveles de subdivisión; el máximo es 2.000 waypoints y se respeta el presupuesto del goal. El suavizado mantiene bloqueado el primer punto y solo acepta cambios que conservan restricciones. Se temporiza con `IterativeParabolicTimeParameterization` y los factores efectivos del goal (defaults Alpha `0.1 / 0.1`); después se valida la curva quíntica que se ejecutará. Puede subdividir, volver a temporizar y dilatar uniformemente el tiempo para cumplir los límites dinámicos. Los puntos incluyen q/v/a y tiempos estrictamente crecientes desde cero.
 
@@ -333,37 +264,45 @@ Antes de temporizar, cada segmento articular se muestrea con al menos cuatro sub
 
 La validación geométrica tiene resolución numérica finita, no constituye una prueba de colisión continua. Un fallo de búsqueda significa que no se encontró una solución válida dentro del presupuesto, no que la pose sea globalmente inalcanzable. Los obstáculos que cambien después del despacho requieren la supervisión de ejecución del sistema existente.
 
-## Pruebas y compilación por el usuario
+## Pruebas
 
-Se han añadido suites C++ de planificador, transporte y servidor, y regresiones del backend task. Cubren brazos con distinto número de joints, A/B intercambiados, reparto del movimiento, pesos iguales, cero e inválidos, límites articulares, tolerancias, continuidad, colisiones entre puntos, temporización, FK y visualización, flujo pendiente, backend desactivado, inicio común, rechazo parcial, cancelación y ausencia de reanudación.
-
-Las regresiones nuevas de referencia en la base incluyen referencia girada,
-orientaciones no conmutativas, intercambio A/B, jacobiano relativo al mover el
-brazo A, rechazo de referencias móviles y validación del frame en el servidor.
-La implementación de este cambio se comprobó sin compilar; esas pruebas C++
-quedan pendientes de la compilación y ejecución por el usuario.
-
-Desde la raíz del workspace, el usuario puede compilar los paquetes y ejecutar las pruebas C++:
+Las suites C++ cubren la geometría compartida (jacobiano por diferencias finitas y feedforward), el planner de facing (error inicial cero, roll, rechazos, base fija, revalidación), el servidor, la tarea (`FacingReference` y caducidad) y la simulación STPIK. Desde la raíz del workspace:
 
 ```bash
-cd /home/salva/sura_ws_meta
-colcon build --packages-select sura_manipulation_actions task_priority_kinematic_control_rqt
-source install/setup.bash
-colcon test --packages-select sura_manipulation_actions task_priority_kinematic_control_rqt
+cd /home/salva/sura_ws_new_new
+colcon test --packages-select sura_manipulation_actions task_priority_kinematic_control task_priority_kinematic_control_rqt
 colcon test-result --verbose
 ```
 
-## Backend `pose` (experimental)
+## Backend `facing`
 
-El backend se puede elegir por goal con el campo `execution_backend` de la acción (`controller`, `task`, `pose`); vacío usa el parámetro `execution_backend` del servidor. En el panel de tareas está en la pestaña Bimanual Cartesian.
+Se elige por goal (`execution_backend:=facing`) o como valor del servidor; el valor `pose` del launch común se trata como `facing`. Requisitos, que el servidor comprueba con el servicio `.../task_priority/check_facing_execution` sin cambiar la jerarquía:
 
-Con `execution_backend:=pose` como valor por defecto, el servidor no envía la trayectoria articular a los controladores. Antes de ejecutar valida cada brazo con STPIK y después muestrea el plan (interpolación lineal de las articulaciones planificadas y cinemática directa). Las poses de la pinza se expresan en el frame del modelo, que es el world de las tareas. Cada tick publica en `<controller>/task_priority/tasks/<task_id>/target` la pose y en `.../feedforward` la velocidad lineal y angular, calculada por diferencias centrales. Al terminar o cancelar, publica velocidad cero y restaura el auto-update.
+- `task_priority_controller` activo.
+- `EndEffectors_Facing` habilitada, sobre los mismos frames de herramienta y con `min_distance` no mayor que `planning.facing_min_distance`.
+- `robot_nominal` habilitada y con prioridad por debajo de la de facing.
+- `left_pose`, `right_pose` y `bimanual_joint_trajectory` deshabilitadas. Las tareas de pose de las puntas no intervienen ni en la simulación ni en la ejecución.
 
-Validación STPIK: se envía a `<controller>/task_priority/check_cartesian_trajectory` una muestra de la pose de cada brazo cada 10 ms (campo `samples` de la acción). Los parámetros `execution.tip_path_tolerance`, `execution.tip_goal_tolerance`, `execution.goal_time_tolerance` y `pose.stpik_timeout` son los mismos que en el planificador de un brazo. El backend no ejecuta si alguno de los dos brazos falla; si STPIK no está disponible, el plan se retiene.
+Secuencia, igual que el backend de pose de un brazo: comprobación, STPIK y, cada 10 ms con el reloj ROS, publicación de las dos referencias en el mismo progreso `s(t)`:
 
-Parámetros por brazo (`arms.<nombre>.`): `pose_task` (por defecto `right_pose` / `left_pose` según el nombre del brazo), `pose_controller_node`, `pose_target_topic`, `pose_feedforward_topic` y `pose_stpik_action`.
+- `.../tasks/EndEffectors_Facing/facing_reference`, con feedforward `dref/ds · ds/dt`.
+- `.../tasks/robot_nominal/reference`, con las articulaciones y velocidades planificadas y la máscara `activation` que anula las seis filas de base. Con la base anulada, `robot_nominal` solo sigue los brazos y no reapunta `base_pose`.
 
-Limitaciones actuales:
-- Ambas tareas son igualdades: el planificador todavía no reserva una banda de tolerancia para el brazo que sujeta la red.
-- La prioridad entre `left_pose` y `right_pose` se configura en el controlador, no aquí.
-- La validación STPIK depende de que el world de las tareas coincida con el frame del modelo.
+El servidor mide el facing con los estados articulares: aborta si sale de `execution.facing_path_tolerance` durante el recorrido, termina al entrar en `execution.facing_goal_tolerance` una vez acabado el tiempo y falla si no lo consigue en `execution.goal_time_tolerance`. En todos los casos deja ambas referencias con velocidad cero donde se detuvieron (en el objetivo si tuvo éxito).
+
+```bash
+ros2 service call /set_task_enabled task_priority_kinematic_control/srv/SetTaskEnabled \
+  '{task_id: left_pose, enabled: false}'
+ros2 service call /set_task_enabled task_priority_kinematic_control/srv/SetTaskEnabled \
+  '{task_id: right_pose, enabled: false}'
+ros2 service call /set_task_enabled task_priority_kinematic_control/srv/SetTaskEnabled \
+  '{task_id: bimanual_joint_trajectory, enabled: false}'
+ros2 service call /set_task_enabled task_priority_kinematic_control/srv/SetTaskEnabled \
+  '{task_id: EndEffectors_Facing, enabled: true}'
+ros2 service call /set_task_enabled task_priority_kinematic_control/srv/SetTaskEnabled \
+  '{task_id: robot_nominal, enabled: true}'
+```
+
+STPIK recibe en `check_cartesian_trajectory` el `facing_path`, la nominal (articulaciones, base y máscara) y `nominal_progress`, y simula la jerarquía completa. Las tolerancias `execution.facing_path_tolerance` y `execution.facing_goal_tolerance` siguen el orden de las filas; junto a `execution.goal_time_tolerance` y `facing.stpik_timeout` son parámetros del servidor. Con la ganancia por defecto de facing (0.2) la convergencia final puede requerir ampliar `execution.goal_time_tolerance`.
+
+Parámetros por par (`pairs.<nombre>.`): `facing_task`, `nominal_task`, `facing_reference_topic`, `nominal_reference_topic`, `facing_stpik_action`, `facing_ready_service` y `disabled_tasks`.

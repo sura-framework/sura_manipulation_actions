@@ -71,6 +71,12 @@ def _setup(context):
     pipelines = [os.path.join(moveit_share, arg(name)) for name in ("planning_pipelines_file", "ompl_planning_file")]
     actions = []
     marker_parameters = {"robot_namespace": namespace, "use_sim_time": enabled("use_sim_time")}
+    if enabled("zip_tie_tip_offset"):
+        actions.append(Node(package="topic_tools", executable="relay",
+            name="zip_tie_tip_offset", output="screen",
+            arguments=[f"{prefix}/brida/tip_pose",
+                       f"{prefix}/alpha/controller/task_priority/tasks/right_pose/offset"],
+            parameters=[{"use_sim_time": enabled("use_sim_time")}]))
     if enabled("launch_marker_visualization"):
         actions.append(Node(package="sura_manipulation_actions",
             executable="manipulation_marker_visualization.py",
@@ -98,6 +104,11 @@ def _setup(context):
             raise ValueError(f"{config_arg} must contain /**: ros__parameters:")
         config = _render(document["/**"]["ros__parameters"], namespace)
         config.update(common)
+        if flag == "launch_cartesian":
+            if enabled("predictive_local_planner"):
+                config["local_planner.enabled"] = True
+            if enabled("zip_tie_tip_offset"):
+                config["local_planner.require_tip_offset"] = True
         config["planning.default_planning_time"] = float(arg("default_planning_time"))
         config["execution.controller_wait_timeout"] = float(arg("controller_wait_timeout"))
         config["execution.feedback_rate"] = float(arg("execution_feedback_rate"))
@@ -120,6 +131,14 @@ def _setup(context):
             f"{mode}.reference_frame": config.get(reference_key,
                 f"{namespace}/base_link".lstrip("/") if mode == "bimanual" else "world_ned"),
         })
+        # Planning markers follow the controlled point of each pose task (use_offset): same topics as the planner.
+        for arm in config["arm_names"]:
+            target_topic = config.get(f"arms.{arm}.pose_target_topic", "")
+            if target_topic.endswith("/target"):
+                task_topic = target_topic[:-len("/target")]
+                marker_parameters[f"arms.{arm}.pose_offset_topic"] = config.get(
+                    f"arms.{arm}.pose_offset_topic", task_topic + "/offset")
+                marker_parameters[f"arms.{arm}.pose_use_offset_topic"] = task_topic + "/use_offset"
         server(executable, [robot, limits, kinematics, config])
     if enabled("launch_planning_markers") and (enabled("launch_cartesian") or enabled("launch_bimanual_cartesian")):
         actions.append(Node(package="task_priority_kinematic_control_rqt", executable="planning_marker_server",
@@ -156,6 +175,8 @@ def generate_launch_description():
         "joint_limits_file": "moveit2/joint_limits.yaml", "kinematics_file": "moveit2/kinematics.yaml",
         "predefined_poses_file": os.path.join(share, "config", "predefined_poses.yaml"),
         "planner_config_file": os.path.join(share, "config", "bimanual_cartesian_planner.yaml"),
+        "predictive_local_planner": "false",
+        "zip_tie_tip_offset": "false",
         "cartesian_planner_config_file": os.path.join(share, "config", "single_arm_cartesian_planner.yaml"),
         "left_task_action": "", "right_task_action": "", "bimanual_group_name": "dual_alpha",
         "default_planning_time": "5.0", "default_goal_tolerance": "0.02", "controller_wait_timeout": "5.0",

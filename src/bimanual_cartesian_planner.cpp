@@ -54,6 +54,7 @@ struct Evaluation
   Eigen::Isometry3d arm_b = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d relative = Eigen::Isometry3d::Identity();
   Eigen::MatrixXd arm_a_jacobian;
+  Eigen::MatrixXd arm_b_jacobian;
   Eigen::MatrixXd relative_jacobian;
 };
 
@@ -306,8 +307,70 @@ public:
     const auto current = evaluate(q0);
     arm_a0 = current.arm_a;
     relative0 = current.relative;
+    if (!single_arm && !initializeFacing(current, error)) {return false;}
     if (!valid(q0, 0.0, error)) {error = "Invalid initial state: " + error; return false;}
     return true;
+  }
+
+  // The reference starts at the measured geometry, so the initial error is zero.
+  bool initializeFacing(const Evaluation & current, std::string & error)
+  {
+    const auto & request = goal.facing;
+    if (!facing::pureAxis(request.left_pointing_axis, left_goal, error)) {
+      error = "left_pointing_axis: " + error; return false;
+    }
+    if (!facing::pureAxis(request.right_pointing_axis, right_goal, error)) {
+      error = "right_pointing_axis: " + error; return false;
+    }
+    if (!facing::endpoints(current.arm_a, current.arm_b, left_goal, right_goal, request.roll,
+      request.distance, options.facing_min_distance, facing_start, facing_goal, error))
+    {return false;}
+    buildFacingPath();
+    return true;
+  }
+
+  // The staged reference between facing_start and facing_goal.
+  void buildFacingPath()
+  {
+    std::string ignored;
+    facing_path.init(facing::stagedKnots(facing_start, facing_goal,
+      options.facing_orientation_fraction, &facing_stage, options.angular_step), ignored);
+  }
+
+  facing::Rows facingRows(const Evaluation & current, double progress, bool jacobians) const
+  {
+    static const Eigen::MatrixXd empty;
+    return facing::evaluate(current.arm_a, current.arm_b,
+      jacobians ? current.arm_a_jacobian : empty, jacobians ? current.arm_b_jacobian : empty,
+      left_goal, right_goal, facing_path.sample(progress), options.facing_min_distance);
+  }
+
+  // Row tolerances and weights of the six task rows (slack/merit form).
+  Vector6 rowTolerances() const
+  {
+    Vector6 out;
+    if (single_arm) {
+      out.head<3>() = goal.relative_position_tolerance;
+      out.tail<3>() = goal.relative_orientation_tolerance;
+    } else {
+      out.head<4>().setConstant(goal.facing.pointing_tolerance / std::sqrt(2.0));
+      out(4) = goal.facing.roll_tolerance;
+      out(5) = goal.facing.distance_tolerance;
+    }
+    return out;
+  }
+
+  Vector6 rowWeights() const
+  {
+    Vector6 out;
+    if (single_arm) {
+      out.head<3>().setConstant(options.position_weight);
+      out.tail<3>().setConstant(options.orientation_weight);
+    } else {
+      out.head<5>().setConstant(options.orientation_weight);
+      out(5) = options.position_weight;
+    }
+    return out;
   }
 
   bool stopped(std::string & error) const
@@ -328,7 +391,8 @@ public:
     if (!jacobians) {return result;}
     result.arm_a_jacobian = Eigen::MatrixXd::Zero(6, q.size());
     if (!single_arm) {result.arm_a_jacobian = jacobian(state, arm_a_tip, arm_a.group_name);}
-    const Eigen::MatrixXd arm_b_jacobian = jacobian(state, arm_b_tip, arm_b.group_name);
+    result.arm_b_jacobian = jacobian(state, arm_b_tip, arm_b.group_name);
+    const Eigen::MatrixXd & arm_b_jacobian = result.arm_b_jacobian;
     result.relative_jacobian = Eigen::MatrixXd::Zero(6, q.size());
     const Eigen::Matrix3d rotation = model_from_reference.rotation().transpose();
     result.relative_jacobian.topRows(3) = rotation * (arm_b_jacobian.topRows(3) -
@@ -359,6 +423,7 @@ public:
 
   Vector6 errorAt(const Evaluation & current, double progress) const
   {
+    if (!single_arm) {return facingRows(current, progress, false).error;}
     const auto target = BimanualCartesianPlanner::interpolateRelativePose(
       relative0, goal.relative_target, progress);
     Vector6 error;
@@ -380,13 +445,23 @@ public:
       (q.array() < lower.array() - 1.0e-9).any() || (q.array() > upper.array() + 1.0e-9).any())
     {error = "Joint position limits exceeded"; return false;}
     const auto current = evaluate(q);
-    const auto residual = errorAt(current, progress);
-    if ((residual.head<3>().cwiseAbs().array() >
-      goal.relative_position_tolerance.array() + options.position_epsilon).any() ||
-      (residual.tail<3>().cwiseAbs().array() >
-      goal.relative_orientation_tolerance.array() + options.orientation_epsilon).any())
-    {error = single_arm ? "Tool pose is outside the Cartesian tolerances" :
-      "Relative pose is outside the Cartesian tolerances"; return false;}
+    if (single_arm) {
+      const auto residual = errorAt(current, progress);
+      if ((residual.head<3>().cwiseAbs().array() >
+        goal.relative_position_tolerance.array() + options.position_epsilon).any() ||
+        (residual.tail<3>().cwiseAbs().array() >
+        goal.relative_orientation_tolerance.array() + options.orientation_epsilon).any())
+      {error = "Tool pose is outside the Cartesian tolerances"; return false;}
+    } else {
+      const auto rows = facingRows(current, progress, false);
+      if (!rows.valid) {error = "Tools are closer than the facing minimum distance"; return false;}
+      if (!rows.roll_valid) {error = "Facing roll is undefined along the path"; return false;}
+      const double pointing = goal.facing.pointing_tolerance + options.orientation_epsilon;
+      if (rows.left_angle > pointing || rows.right_angle > pointing ||
+        std::abs(rows.error(4)) > goal.facing.roll_tolerance + options.orientation_epsilon ||
+        std::abs(rows.error(5)) > goal.facing.distance_tolerance + options.position_epsilon)
+      {error = "Facing geometry is outside the tolerances"; return false;}
+    }
     auto state = stateAt(q);
     if (scene->isStateColliding(state)) {error = "Trajectory intersects the planning scene"; return false;}
     return true;
@@ -425,18 +500,26 @@ public:
     for (int iteration = 0; iteration < options.max_iterations; ++iteration) {
       if (stopped(error)) {return false;}
       const auto current = evaluate(q, true);
-      const Vector6 residual = errorAt(current, progress);
       if (valid(q, progress, error)) {solution = q; return true;}
+      Vector6 residual;
+      Eigen::MatrixXd task_jacobian;
+      if (single_arm) {
+        residual = errorAt(current, progress);
+        task_jacobian = current.relative_jacobian;
+      } else {
+        const auto rows = facingRows(current, progress, true);
+        if (!rows.valid) {error = "Tools are closer than the facing minimum distance"; return false;}
+        residual = rows.error;
+        task_jacobian = rows.jacobian;
+      }
       const int variables = static_cast<int>(n) + 6;
       const int count = static_cast<int>(n) + 18;
       Eigen::MatrixXd h = Eigen::MatrixXd::Zero(variables, variables);
       Eigen::VectorXd g = Eigen::VectorXd::Zero(variables);
-      Vector6 weights;
-      weights.head<3>().setConstant(options.position_weight);
-      weights.tail<3>().setConstant(options.orientation_weight);
-      h.topLeftCorner(n, n) = 2.0 * current.relative_jacobian.transpose() *
-        weights.asDiagonal() * current.relative_jacobian;
-      g.head(n) = -2.0 * current.relative_jacobian.transpose() * weights.asDiagonal() * residual;
+      const Vector6 weights = rowWeights();
+      h.topLeftCorner(n, n) = 2.0 * task_jacobian.transpose() *
+        weights.asDiagonal() * task_jacobian;
+      g.head(n) = -2.0 * task_jacobian.transpose() * weights.asDiagonal() * residual;
       for (Eigen::Index i = 0; i < n; ++i) {
         const double joint_weight = joint_weights(i);
         const double regularization = options.continuity_weight + joint_weight + options.nominal_weight;
@@ -458,14 +541,12 @@ public:
         l(row) = std::max(lower(i) - q(i), -step);
         u(row) = std::min(upper(i) - q(i), step);
       }
-      Vector6 tolerances;
-      tolerances.head<3>() = goal.relative_position_tolerance;
-      tolerances.tail<3>() = goal.relative_orientation_tolerance;
+      const Vector6 tolerances = rowTolerances();
       for (int axis = 0; axis < 6; ++axis) {
-        a.block(row, 0, 1, n) = current.relative_jacobian.row(axis);
+        a.block(row, 0, 1, n) = task_jacobian.row(axis);
         a(row, n + axis) = 1.0;
         l(row++) = residual(axis) - tolerances(axis);
-        a.block(row, 0, 1, n) = current.relative_jacobian.row(axis);
+        a.block(row, 0, 1, n) = task_jacobian.row(axis);
         a(row, n + axis) = -1.0;
         u(row++) = residual(axis) + tolerances(axis);
         a(row, n + axis) = 1.0;
@@ -1039,6 +1120,10 @@ public:
   Eigen::VectorXd q0, qnom, lower, upper, vmax, amax, joint_weights;
   Eigen::Isometry3d arm_a0 = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d relative0 = Eigen::Isometry3d::Identity();
+  facing::PureAxis left_goal, right_goal;
+  facing::Reference facing_start, facing_goal;
+  facing::Path facing_path;
+  double facing_stage = 0.0;
   std::string reference_frame;
   Eigen::Isometry3d model_from_reference = Eigen::Isometry3d::Identity();
 
@@ -1047,6 +1132,7 @@ private:
   {
     if (!q.allFinite()) {return before;}
     const auto current = evaluate(q);
+    if (!single_arm) {return projectedFacingProgress(current, before, after);}
     const Eigen::Vector3d translation = goal.relative_target.translation() - relative0.translation();
     double progress = 0.5 * (before + after);
     if (translation.squaredNorm() > 1.0e-24) {
@@ -1062,6 +1148,38 @@ private:
       }
     }
     return std::isfinite(progress) ? std::clamp(progress, before, after) : before;
+  }
+
+  // Progress along the facing path that best matches the current geometry, searched in
+  // [before, after] with the same metre/radian normalisation as the waypoint count.
+  double projectedFacingProgress(const Evaluation & current, double before, double after) const
+  {
+    bool valid = true;
+    const auto mismatch = [&](double s) {
+        const auto rows = facingRows(current, s, false);
+        valid = valid && rows.valid;
+        return std::pow(std::max(rows.left_angle, rows.right_angle) / options.angular_step, 2) +
+               std::pow(rows.error(4) / options.angular_step, 2) +
+               std::pow(rows.error(5) / goal.cartesian_step, 2);
+      };
+    // Coarse grid, then golden-section refinement around the best sample.
+    constexpr int samples = 16;
+    double best = before, best_error = std::numeric_limits<double>::infinity();
+    for (int i = 0; i <= samples; ++i) {
+      const double s = before + (after - before) * i / samples;
+      const double error = mismatch(s);
+      if (error < best_error) {best_error = error; best = s;}
+    }
+    if (!valid) {return before;}
+    const double step = (after - before) / samples;
+    double a = std::max(before, best - step), b = std::min(after, best + step);
+    constexpr double ratio = 0.6180339887498949;
+    for (int iteration = 0; iteration < 40 && b - a > 1e-12; ++iteration) {
+      const double c = b - ratio * (b - a), d = a + ratio * (b - a);
+      if (mismatch(c) <= mismatch(d)) {b = d;} else {a = c;}
+    }
+    const double refined = 0.5 * (a + b);
+    return mismatch(refined) <= best_error ? refined : best;
   }
 
   Eigen::MatrixXd jacobian(
@@ -1105,24 +1223,48 @@ private:
 
   double merit(const Eigen::VectorXd & q, const Eigen::VectorXd & previous, double s, double penalty) const
   {
-    const auto residual = errorAt(evaluate(q), s);
-    double result = options.position_weight * residual.head<3>().squaredNorm() +
-      options.orientation_weight * residual.tail<3>().squaredNorm() +
+    const auto current = evaluate(q);
+    if (!single_arm && !facingRows(current, s, false).valid) {
+      return std::numeric_limits<double>::infinity();
+    }
+    const auto residual = errorAt(current, s);
+    double result = residual.dot(rowWeights().asDiagonal() * residual) +
       options.continuity_weight * (q - previous).squaredNorm() +
       options.nominal_weight * (q - qnom).squaredNorm();
     for (Eigen::Index i = 0; i < q.size(); ++i) {
       result += joint_weights(i) * std::pow(q(i) - q0(i), 2);
     }
-    const Eigen::Vector3d p_excess = (residual.head<3>().cwiseAbs() - goal.relative_position_tolerance).cwiseMax(0.0);
-    const Eigen::Vector3d r_excess = (residual.tail<3>().cwiseAbs() - goal.relative_orientation_tolerance).cwiseMax(0.0);
-    return result + penalty * (p_excess.squaredNorm() + r_excess.squaredNorm());
+    const Vector6 excess = (residual.cwiseAbs() - rowTolerances()).cwiseMax(0.0);
+    return result + penalty * excess.squaredNorm();
   }
 
 };
 
-bool validOptions(const GoalSpec & goal, const Options & options, std::string & error)
+bool validOptions(
+  const GoalSpec & goal, const Options & options, bool single_arm, std::string & error)
 {
   const auto finite_positive = [](double value) {return std::isfinite(value) && value > 0.0;};
+  if (!single_arm) {
+    const auto & request = goal.facing;
+    facing::PureAxis axis;
+    if (!facing::pureAxis(request.left_pointing_axis, axis, error)) {
+      error = "left_pointing_axis: " + error; return false;
+    }
+    if (!facing::pureAxis(request.right_pointing_axis, axis, error)) {
+      error = "right_pointing_axis: " + error; return false;
+    }
+    if (std::isinf(request.roll)) {error = "Facing roll must be finite or NaN"; return false;}
+    if (!finite_positive(options.facing_min_distance) || !std::isfinite(request.distance) ||
+      request.distance < options.facing_min_distance)
+    {error = "Facing distance must be finite and at least the minimum distance"; return false;}
+    for (const double value : {request.pointing_tolerance, request.roll_tolerance,
+      request.distance_tolerance})
+    {
+      if (!std::isfinite(value) || value < 0.0) {
+        error = "Facing tolerances must be finite and non-negative"; return false;
+      }
+    }
+  }
   if (!goal.relative_target.matrix().allFinite() ||
     (goal.relative_target.rotation().transpose() * goal.relative_target.rotation() - Eigen::Matrix3d::Identity()).norm() > 1.0e-6 ||
     std::abs(goal.relative_target.rotation().determinant() - 1.0) > 1.0e-6 ||
@@ -1234,13 +1376,24 @@ bool planCartesian(
   const BimanualCartesianPlanner::Progress & progress, bool single_arm)
 {
   output = PlannedTrajectory();
-  if (!validOptions(goal, options, message)) {return false;}
+  if (!validOptions(goal, options, single_arm, message)) {return false;}
   try {
     PlanningContext context(scene, start, arm_a, arm_b, pair, goal, options, canceled, progress, single_arm);
     if (context.stopped(message) || !context.initialize(message)) {return false;}
-    const double distance = (goal.relative_target.translation() - context.relative0.translation()).norm();
-    const double angle = BimanualCartesianPlanner::orientationError(goal.relative_target.rotation(), context.relative0.rotation()).norm();
-    const double required = std::max(distance / goal.cartesian_step, angle / options.angular_step);
+    double distance = 0.0, angle = 0.0;
+    if (single_arm) {
+      distance = (goal.relative_target.translation() - context.relative0.translation()).norm();
+      angle = BimanualCartesianPlanner::orientationError(
+        goal.relative_target.rotation(), context.relative0.rotation()).norm();
+    } else {
+      facing::changes(context.facing_start, context.facing_goal, distance, angle);
+    }
+    double required = std::max(distance / goal.cartesian_step, angle / options.angular_step);
+    if (!single_arm && context.facing_stage > 0.0) {
+      // Each stage keeps the nominal resolution over its own share of the progress.
+      required = std::max(angle / options.angular_step / context.facing_stage,
+        distance / goal.cartesian_step / (1.0 - context.facing_stage));
+    }
     if (!std::isfinite(required) || required > options.max_waypoints - 1) {
       message = "Requested Cartesian resolution exceeds the maximum waypoint count"; return false;
     }
@@ -1249,7 +1402,13 @@ bool planCartesian(
     for (int i = 1; i <= count; ++i) {
       const double s = static_cast<double>(i) / count;
       if (progress) {progress(0.1 + 0.65 * s, single_arm ? "solving_constrained_cartesian_ik" : "solving_constrained_bimanual_ik");}
-      if (!context.appendSegment(waypoints, s, 0, message)) {return false;}
+      if (!context.appendSegment(waypoints, s, 0, message)) {
+        if (!single_arm && context.facing_stage > 0.0) {
+          message += s <= context.facing_stage + 1e-9 ? " (orientation stage: pointing and roll)" :
+            " (distance stage)";
+        }
+        return false;
+      }
     }
     if (progress) {progress(0.8, "smoothing_and_validating_segments");}
     context.smooth(waypoints, message);
@@ -1268,9 +1427,17 @@ bool planCartesian(
       completed.available_dofs = context.available_dofs;
       completed.base_reference_pose = context.base_reference_pose;
     }
+    if (!single_arm) {
+      completed.facing_left_goal = context.left_goal;
+      completed.facing_right_goal = context.right_goal;
+      completed.facing_start = context.facing_start;
+      completed.facing_target = context.facing_goal;
+      // The exact reference of the plan, as a function of progress.
+      completed.facing_path = context.facing_path.knots();
+    }
     output = std::move(completed);
     message = single_arm ? "Valid single-arm Cartesian joint trajectory planned" :
-      "Valid constrained bimanual Cartesian joint trajectory planned";
+      "Valid end-effectors facing joint trajectory planned";
     return true;
   } catch (const std::exception & exception) {
     message = std::string("Cartesian planning failed: ") + exception.what();
@@ -1284,7 +1451,7 @@ bool validateCartesian(
   const PlannedTrajectory & plan, std::string & message,
   const BimanualCartesianPlanner::CancelCheck & canceled, bool single_arm)
 {
-  if (!validOptions(goal, options, message) || !plan.trajectory ||
+  if (!validOptions(goal, options, single_arm, message) || !plan.trajectory ||
     plan.trajectory->getWayPointCount() == 0)
   {message = "Cannot validate an empty or malformed stored plan: " + message; return false;}
   try {
@@ -1331,8 +1498,26 @@ bool validateCartesian(
       (recorded_reference.matrix() - plan.model_from_reference.matrix()).norm() > 1.0e-8 ||
       (recorded_arm_a.matrix() - plan.initial_arm_a_pose.matrix()).norm() > 1.0e-8 ||
       (recorded_relative.matrix() - plan.initial_relative_pose.matrix()).norm() > 1.0e-8 ||
-      (goal.relative_target.matrix() - plan.relative_target.matrix()).norm() > 1.0e-8)
+      (single_arm &&
+      (goal.relative_target.matrix() - plan.relative_target.matrix()).norm() > 1.0e-8))
     {message = "Stored plan pose references no longer match its initial state or goal"; return false;}
+    if (!single_arm) {
+      const auto differs = [](const facing::Reference & a, const facing::Reference & b) {
+          return (a.left_axis - b.left_axis).norm() > 1.0e-6 ||
+                 (a.right_axis - b.right_axis).norm() > 1.0e-6 ||
+                 std::abs(facing::wrapAngle(a.roll - b.roll)) > 1.0e-6 ||
+                 std::abs(a.distance - b.distance) > 1.0e-6;
+        };
+      // The start was measured at the recorded arm joints; a requested NaN roll
+      // resolves to that measured value.
+      auto expected_goal = context.facing_goal;
+      if (std::isnan(goal.facing.roll)) {expected_goal.roll = plan.facing_start.roll;}
+      if (differs(context.facing_start, plan.facing_start) || differs(expected_goal, plan.facing_target))
+      {message = "Stored facing references no longer match the initial state or goal"; return false;}
+      context.facing_start = plan.facing_start;
+      context.facing_goal = plan.facing_target;
+      context.buildFacingPath();
+    }
     // Keep the original nominal path while checking FK/collisions with the live
     // non-commanded joints and the current transform of the reference frame.
     context.relative0 = plan.initial_relative_pose;

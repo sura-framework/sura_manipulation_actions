@@ -3,6 +3,20 @@
     robot_namespace: cirtesub
     planning_frame: world_ned
     base_frame: ${robot_namespace}/base_link
+    local_planner.enabled: false
+    local_planner.explore: true
+    local_planner.progress_rate_scale: 1.0
+    local_planner.period: 0.25
+    local_planner.horizon: 0.5
+    local_planner.budget: 1.0
+    local_planner.retreat_window: 0.05
+    local_planner.gain: 0.5
+    local_planner.amplitude: 0.2
+    local_planner.position_scale: 0.1
+    local_planner.angle_scale: 0.5
+    local_planner.recovery_threshold: 0.15
+    local_planner.improvement: 0.02
+    local_planner.weights: [1.0, 1.0, 2.0, 0.01, 0.01, 0.01]
     execution_backend: controller
     joint_states_topic: /${robot_namespace}/alpha/joint_states
     arm_names:

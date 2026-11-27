@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -9,6 +10,7 @@
 
 #include "controller_manager_msgs/srv/list_controllers.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
+#include "rcl_interfaces/srv/get_parameters.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "std_srvs/srv/trigger.hpp"
@@ -48,9 +50,22 @@ private:
   {
     std::string action, controller_name, manager_service;
   };
+  // Last offset (tip pose in the task frame) heard on the pose task's offset topic.
+  struct OffsetState
+  {
+    std::mutex mutex;
+    Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+    std::chrono::steady_clock::time_point received;
+    bool valid = false;
+  };
   struct PoseEndpoint
   {
     std::string controller_node, task_id, target_topic, feedforward_topic, check_action, prepare_action;
+    std::string offset_topic;
+    // Created once at configure: creating and destroying clients while the node spins races in Humble's executor.
+    rclcpp::Client<rcl_interfaces::srv::GetParameters>::SharedPtr parameters;
+    std::shared_ptr<OffsetState> offset = std::make_shared<OffsetState>();
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr offset_subscription;
     std::string nominal_topic;
     rclcpp_action::Client<PrepareAction>::SharedPtr preparer;
     rclcpp_action::Client<CheckAction>::SharedPtr checker;
@@ -73,8 +88,12 @@ private:
     // Whole-body nominal streamed to robot_nominal (optimize_trajectory_nominal).
     bool wants_nominal = false;
     WholeBodyNominal nominal;
+    bool use_predictive_local_planner = false;
+    std::vector<double> nominal_progress;
     trajectory_msgs::msg::JointTrajectory nominal_joints;
     trajectory_msgs::msg::MultiDOFJointTrajectory nominal_base;
+    // The pose task controls the offset point (zip-tie tip): poses and target are tip poses.
+    bool use_tip_offset = false;
     Eigen::Isometry3d pose_start = Eigen::Isometry3d::Identity();
     Eigen::Matrix<double, 6, 1> pose_activation = Eigen::Matrix<double, 6, 1>::Ones();
     Eigen::Isometry3d fixed_from_model = Eigen::Isometry3d::Identity();
@@ -98,6 +117,7 @@ private:
   void planGoal(const std::shared_ptr<PendingPlan> & pending);
   void executePlan(const std::shared_ptr<PendingPlan> & pending);
   void planPoseGoal(const std::shared_ptr<PendingPlan> & pending);
+  bool executePredictive(const PendingPlan &, msg::RobotNominalReference &, std::string &);
   void executePosePlan(const std::shared_ptr<PendingPlan> & pending);
   bool poseBackendReady(PendingPlan & pending, bool & auto_update, std::string & error);
   bool preparePosture(PendingPlan & pending, bool apply, std::string & error);
@@ -105,6 +125,10 @@ private:
     bool & retryable, std::string & error);
   bool validatePosePending(const PendingPlan & pending, std::string & error) const;
   bool readTipPose(const PendingPlan & pending, Eigen::Isometry3d & pose, std::string & error) const;
+  // Reads the pose task's use_offset parameter from the controller (false if it is not declared).
+  bool readUseOffset(const PendingPlan & pending, bool & use, double timeout, std::string & error);
+  // Latest fresh offset of the pose task; fails if none was received or it is older than pose.offset_max_age.
+  bool readTipOffset(const PendingPlan & pending, Eigen::Isometry3d & offset, std::string & error) const;
   void executeCoordinated(const std::shared_ptr<PendingPlan> & pending);
   void cancelCoordinated();
   bool checkControllerTracking(
@@ -135,7 +159,11 @@ private:
   double base_position_tolerance_{0.005}, base_orientation_tolerance_{0.01};
   double pose_linear_velocity_{1.0}, pose_angular_velocity_{0.5};
   double pose_linear_acceleration_{0.4}, pose_angular_acceleration_{0.2};
+  bool predictive_enabled_{false}, require_tip_offset_{false};
+  msg::LocalPrediction prediction_settings_;
+  double prediction_period_{0.25};
   double stpik_timeout_{35.0};
+  double pose_offset_max_age_{0.5};
   bimanual_cartesian::Options planner_options_;
   sura_manipulation_actions::msg::TrajectoryTrackingTolerances default_tracking_tolerances_;
   ExecutionOptions execution_options_;
@@ -145,6 +173,8 @@ private:
   std::unique_ptr<tf2_ros::Buffer> pose_tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> pose_tf_listener_;
   std::unique_ptr<CartesianMoveItContext> context_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr local_path_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr local_base_path_pub_, predicted_path_pub_;
   std::unique_ptr<CartesianTrajectoryVisualization> visualization_;
   std::unique_ptr<TrajectoryExecutor> executor_;
   struct FollowDispatch

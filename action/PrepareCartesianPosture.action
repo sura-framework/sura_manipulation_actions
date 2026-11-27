@@ -17,6 +17,19 @@ string robot_description_semantic
 # initial posture as its first knot (no separate posture search); APPLY repositions,
 # then replans the nominal from the settled state.
 bool full_trajectory false
+# End-effectors facing (non-empty points, implies full_trajectory): task_id is the
+# EndEffectorsFacingTask and path/goal tolerances follow its rows [left pointing(2),
+# right pointing(2), roll, distance]. The path is timed by the rest-to-rest quintic
+# progress over facing_duration and starts at the measured posture (PLAN only).
+# nominal_activation masks robot_nominal; false base rows keep the base where it is.
+# trajectory, tip_frame and tolerance_orientation are ignored.
+FacingPath facing_path
+float64 facing_duration
+bool[] nominal_activation
+# Facing planning only simulates the facing hierarchy, whatever the controller has enabled:
+# task_id and robot_nominal are assumed enabled, robot_nominal below task_id, and these
+# tasks disabled. The running controller is not modified.
+string[] facing_disabled_tasks
 ---
 bool success
 string message
@@ -25,6 +38,8 @@ PosturePreparationSummary proposal
 # world frame; the joint trajectory contains both arms in controller order.
 trajectory_msgs/JointTrajectory nominal_joints
 trajectory_msgs/MultiDOFJointTrajectory nominal_base
+# Geometric Cartesian path fraction at each nominal knot.
+float64[] nominal_progress
 string nominal_method
 float64 nominal_cost
 ---

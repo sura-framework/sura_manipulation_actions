@@ -27,6 +27,8 @@ bool optimize_initial_posture false
 # executing. Exclusive with optimize_initial_posture. The result fills
 # joint_trajectory/base_trajectory/base_path.
 bool optimize_trajectory_nominal false
+# Opt in for this goal. Requires pose, STPIK and optimize_trajectory_nominal.
+bool use_predictive_local_planner false
 # false publishes a plan and waits for execute_pending_trajectory.
 bool execute
 ---
@@ -35,6 +37,7 @@ PosturePreparationSummary proposal
 string message
 trajectory_msgs/JointTrajectory joint_trajectory
 trajectory_msgs/MultiDOFJointTrajectory base_trajectory
+float64[] nominal_progress
 nav_msgs/Path base_path
 nav_msgs/Path path
 # In pose mode only desired_path is populated; optional STPIK runs on Execute.

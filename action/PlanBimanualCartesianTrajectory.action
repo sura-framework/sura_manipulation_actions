@@ -1,12 +1,18 @@
-# Relative displacement/orientation in the configured reference (base) axes:
-# p = p_arm_b - p_arm_a; R = R_arm_b * R_arm_a^T, both expressed there.
-# frame_id must equal relative_reference_frame; this is not an absolute pose.
-string arm_a
-string arm_b
-geometry_msgs/PoseStamped relative_target
-# Relative tolerances in metres and radians; zero remains strict.
-geometry_msgs/Vector3 relative_position_tolerance
-geometry_msgs/Vector3 relative_orientation_tolerance
+# End-effectors facing: both tools face each other along the line that joins them.
+# Left and right arms are fixed by the server configuration; only arm joints move.
+# Axis of each tool (in its own frame) that points to the other one: +-x, +-y or +-z.
+geometry_msgs/Vector3 left_pointing_axis
+geometry_msgs/Vector3 right_pointing_axis
+# Relative roll around the line left -> right [rad]; NaN keeps the measured roll.
+# Zero reference axis per tool (cyclic, same sign): +-x -> +-y, +-y -> +-z, +-z -> +-x.
+float64 roll_angle
+# Distance between both tools [m].
+float64 distance
+# Tolerances along the whole path; zero remains strict. pointing_tolerance is the
+# angle between each tool axis and its reference direction.
+float64 pointing_tolerance
+float64 roll_tolerance
+float64 distance_tolerance
 # Non-positive step/time select the configured defaults.
 float64 cartesian_step
 float64 planning_time
@@ -16,22 +22,30 @@ bool execute
 # These determine trajectory timing, not the planning computation budget.
 float64 velocity_scaling
 float64 acceleration_scaling
-# Execution backend: controller, task or pose. Empty uses the server's execution_backend.
+# Execution backend: controller, task or facing. Empty uses the server's execution_backend.
 string execution_backend
-# Pose execution only: validate both arms with STPIK before streaming. Other backends ignore this.
+# Facing execution only: validate with STPIK before streaming. Other backends ignore this.
 bool use_stpik true
+# Optimize the whole trajectory with the controller's Task Priority hierarchy (the same
+# global planner as the single-arm robot_nominal mode) instead of the local per-waypoint
+# solver. Requires the facing backend; the tracking tolerances are the server's
+# execution.facing_*_tolerance and the timing follows velocity_scaling.
+bool optimize_trajectory_nominal false
+# Progress share in [0, 1) used to reach the pointing axes and the roll before the
+# distance changes; 0 changes everything simultaneously. Negative uses the server's
+# planning.facing_orientation_fraction.
+float64 facing_orientation_fraction -1.0
 ---
 bool success
 string message
 trajectory_msgs/JointTrajectory joint_trajectory
-nav_msgs/Path arm_a_path
-nav_msgs/Path arm_b_path
-# Paths use the existing relative_reference_frame and the latest TF (zero stamp).
-# Relative path positions include the initial arm A position in that frame as
-# a drawing offset: p_view = p_arm_a_initial + (p_arm_b - p_arm_a).
-# Their orientations remain the relative rotation difference, not tool poses.
-nav_msgs/Path relative_path
-nav_msgs/Path desired_relative_path
+# Geometric progress in [0, 1] of each joint_trajectory point.
+float64[] nominal_progress
+# Facing reference as a function of progress (no timing).
+FacingPath facing_path
+# Tool paths reached by forward kinematics, in relative_reference_frame (zero stamp).
+nav_msgs/Path left_path
+nav_msgs/Path right_path
 ---
 float32 progress
 string current_stage

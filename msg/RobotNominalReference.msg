@@ -7,3 +7,8 @@ geometry_msgs/Twist base_twist
 string[] joint_names
 float64[] positions
 float64[] velocities
+# Optional mask for this reference: 6 base rows [x, y, z, roll, pitch, yaw] followed by
+# every joint in controller order. Empty keeps the configured activation; false removes
+# a row while the reference is live (it never enables a disabled one). With all six base
+# rows false the base hold tasks are not retargeted either.
+bool[] activation

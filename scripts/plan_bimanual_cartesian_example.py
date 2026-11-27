@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send a relative goal derived from the current TF, avoiding a guessed pose."""
+"""Send an end-effectors facing goal; the distance defaults to the current one from TF."""
 
 import argparse
 import math
@@ -12,42 +12,26 @@ from sura_manipulation_actions.action import PlanBimanualCartesianTrajectory
 from tf2_ros import Buffer, TransformException, TransformListener
 
 
-def relative_pose_components(arm_a, arm_b):
-    """Displacement and spatial rotation difference in shared reference axes."""
-    position = [getattr(arm_b.translation, axis) - getattr(arm_a.translation, axis)
-                for axis in ("x", "y", "z")]
-    quaternions = []
-    for transform in (arm_a, arm_b):
-        values = [getattr(transform.rotation, axis) for axis in ("x", "y", "z", "w")]
-        norm = math.hypot(*values)
-        if not math.isfinite(norm) or norm < 1e-12:
-            raise RuntimeError("TF orientation must have a finite, nonzero norm")
-        quaternions.append([value / norm for value in values])
-    lx, ly, lz, lw = quaternions[0]
-    fx, fy, fz, fw = quaternions[1]
-    quaternion = [fx * lw - fw * lx - fy * lz + fz * ly,
-                  fy * lw - fw * ly - fz * lx + fx * lz,
-                  fz * lw - fw * lz - fx * ly + fy * lx,
-                  fw * lw + fx * lx + fy * ly + fz * lz]
-    if quaternion[3] < 0.0:
-        quaternion = [-value for value in quaternion]
-    if not all(math.isfinite(value) for value in position):
-        raise RuntimeError("TF position must be finite")
-    return position, quaternion
+AXES = {"+x": (1.0, 0.0, 0.0), "-x": (-1.0, 0.0, 0.0), "+y": (0.0, 1.0, 0.0),
+        "-y": (0.0, -1.0, 0.0), "+z": (0.0, 0.0, 1.0), "-z": (0.0, 0.0, -1.0)}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--robot-namespace", default="cirtesub")
-    parser.add_argument("--arm-a", default="alpha_left")
-    parser.add_argument("--arm-b", default="alpha_right")
-    parser.add_argument("--arm-a-tip", default="")
-    parser.add_argument("--arm-b-tip", default="")
-    parser.add_argument("--reference-frame", default="",
-                        help="Must match relative_reference_frame in the planner; default is robot base_link")
+    parser.add_argument("--left-tip", default="")
+    parser.add_argument("--right-tip", default="")
+    parser.add_argument("--left-axis", choices=AXES, default="+x",
+                        help="Left tool axis that points at the right tool (--left-axis=-x for negative)")
+    parser.add_argument("--right-axis", choices=AXES, default="+x",
+                        help="Right tool axis that points at the left tool")
+    parser.add_argument("--roll", type=float, default=float("nan"),
+                        help="Relative roll [rad]; omitted keeps the measured roll")
+    parser.add_argument("--distance", type=float, default=0.0,
+                        help="Distance between tools [m]; zero uses the current distance plus --delta")
+    parser.add_argument("--delta", type=float, default=0.0,
+                        help="Change of the current distance [m] when --distance is zero")
     parser.add_argument("--action", default="")
-    parser.add_argument("--relative-dx", type=float, default=0.0,
-                        help="Offset in metres along reference/base X; default preserves current relative pose")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--velocity-scaling", type=float, default=0.0,
                         help="Joint velocity limit factor in (0,1]; zero uses server default")
@@ -65,42 +49,30 @@ def main():
     namespace = args.robot_namespace.strip("/")
     frame_prefix = f"{namespace}/" if namespace else ""
     topic_prefix = f"/{namespace}" if namespace else ""
-    arm_a_tip = args.arm_a_tip or f"{frame_prefix}{args.arm_a}/standard_jaws_tool"
-    arm_b_tip = args.arm_b_tip or f"{frame_prefix}{args.arm_b}/standard_jaws_tool"
-    reference = args.reference_frame or f"{frame_prefix}base_link"
+    left_tip = args.left_tip or f"{frame_prefix}alpha_left/standard_jaws_tool"
+    right_tip = args.right_tip or f"{frame_prefix}alpha_right/standard_jaws_tool"
     action_name = args.action or f"{topic_prefix}/manipulation/plan_bimanual_cartesian_trajectory"
     client = ActionClient(node, PlanBimanualCartesianTrajectory, action_name)
     try:
         if not client.wait_for_server(timeout_sec=10.0):
             raise RuntimeError(f"Action unavailable: {action_name}; configure the lifecycle node")
-        future = buffer.wait_for_transform_async(reference, arm_a_tip, Time())
-        rclpy.spin_until_future_complete(node, future, timeout_sec=10.0)
-        if not future.done():
-            raise RuntimeError("Timed out waiting for the reference-to-arm-A TF")
-        arm_a_tf = buffer.lookup_transform(reference, arm_a_tip, Time())
-        stamp = Time.from_msg(arm_a_tf.header.stamp)
-        future = buffer.wait_for_transform_async(reference, arm_b_tip, stamp)
-        rclpy.spin_until_future_complete(node, future, timeout_sec=10.0)
-        if not future.done():
-            raise RuntimeError("Timed out waiting for the reference-to-arm-B TF at the same timestamp")
-        arm_b_tf = buffer.lookup_transform(reference, arm_b_tip, stamp)
-        position, quaternion = relative_pose_components(arm_a_tf.transform, arm_b_tf.transform)
+        distance = args.distance
+        if distance <= 0.0:
+            future = buffer.wait_for_transform_async(left_tip, right_tip, Time())
+            rclpy.spin_until_future_complete(node, future, timeout_sec=10.0)
+            if not future.done():
+                raise RuntimeError("Timed out waiting for the TF between both tools")
+            offset = buffer.lookup_transform(left_tip, right_tip, Time()).transform.translation
+            distance = math.hypot(offset.x, offset.y, offset.z) + args.delta
         goal = PlanBimanualCartesianTrajectory.Goal()
-        goal.arm_a = args.arm_a
-        goal.arm_b = args.arm_b
-        goal.relative_target.header.frame_id = reference
-        goal.relative_target.header.stamp = arm_a_tf.header.stamp
-        goal.relative_target.pose.position.x = position[0] + args.relative_dx
-        goal.relative_target.pose.position.y = position[1]
-        goal.relative_target.pose.position.z = position[2]
-        for axis, value in zip(("x", "y", "z", "w"), quaternion):
-            setattr(goal.relative_target.pose.orientation, axis, value)
-        goal.relative_position_tolerance.x = 0.002
-        goal.relative_position_tolerance.y = 0.002
-        goal.relative_position_tolerance.z = 0.002
-        goal.relative_orientation_tolerance.x = 0.03
-        goal.relative_orientation_tolerance.y = 0.03
-        goal.relative_orientation_tolerance.z = 0.03
+        for vector, name in ((goal.left_pointing_axis, args.left_axis),
+                             (goal.right_pointing_axis, args.right_axis)):
+            vector.x, vector.y, vector.z = AXES[name]
+        goal.roll_angle = args.roll
+        goal.distance = distance
+        goal.pointing_tolerance = 0.05
+        goal.roll_tolerance = 0.05
+        goal.distance_tolerance = 0.005
         goal.cartesian_step = 0.005
         goal.planning_time = 10.0
         goal.velocity_scaling = args.velocity_scaling

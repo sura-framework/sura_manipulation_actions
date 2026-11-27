@@ -36,6 +36,10 @@ public:
     const std::vector<std::string> & joint_names, double timeout, double max_age,
     planning_scene::PlanningScenePtr & scene, std::string & error,
     const std::function<bool()> & canceled = {}) const;
+  // Latest observed positions, without copying the planning scene. For supervision.
+  bool jointPositions(
+    const std::vector<std::string> & joint_names, double max_age,
+    std::vector<double> & positions, std::string & error) const;
   void display(const robot_trajectory::RobotTrajectory & trajectory) const;
   // Resolve input and floating base at one common TF instant, then freeze them.
   bool transformTarget(

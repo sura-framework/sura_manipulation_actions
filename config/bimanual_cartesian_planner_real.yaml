@@ -39,15 +39,16 @@
     planning.position_weight: 10.0
     planning.orientation_weight: 2.0
     planning.continuity_weight: 5.0
+    # Active MoveIt order: alpha_left e,d,c,b; alpha_right e,d,c,b (logged at configure).
     planning.weights:
     - 0.0
     - 0.0
     - 0.0
-    - 1.57
     - 0.0
     - 0.0
     - 0.0
-    - 1.57
+    - 0.0
+    - 0.0
     planning.nominal_weight: 0.1
     planning.smoothness_weight: 0.5
     planning.optimize_trajectory: true
@@ -98,3 +99,10 @@
     execution.start_prismatic_tolerance: 0.0001
     execution.base_position_tolerance: 0.05
     execution.base_orientation_tolerance: 0.1
+    # Facing: left/right are pairs.<active_pair>.arms[0]/[1].
+    planning.facing_min_distance: 0.02
+    # Progress share used to reach pointing and roll before the distance changes; 0 = simultaneous.
+    planning.facing_orientation_fraction: 0.4
+    # STPIK tolerances per row: left pointing (2), right pointing (2), roll, distance.
+    execution.facing_path_tolerance: [0.1, 0.1, 0.1, 0.1, 0.15, 0.02]
+    execution.facing_goal_tolerance: [0.05, 0.05, 0.05, 0.05, 0.1, 0.01]

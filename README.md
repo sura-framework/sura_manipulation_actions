@@ -11,10 +11,12 @@ la pose final; el backend `controller` admite movimientos con base bloqueada.
 El backend `pose`, seleccionable como **Pose** en RQT, publica poses de
 `standard_jaws_tool` directamente en `left_pose` o `right_pose` y deja que la
 jerarquía resuelva el movimiento, sin IK ni validación previa de colisiones.
+Con `use_offset` activo en esa tarea, el backend `pose` planifica y ejecuta la pose del punto
+controlado (p. ej. la punta de una brida) en lugar de la del tool; ver la guía cartesiana de un brazo.
 Consulta [la guía cartesiana de un brazo](docs/single_arm_cartesian_planner.md)
 para lanzamiento, configuración, servicios y selección de pose/velocidad.
 
-La nueva acción `PlanBimanualCartesianTrajectory`, su configuración y el flujo de activación manual se describen en [la guía cartesiana bimanual](docs/bimanual_cartesian_planner.md). Los apartados siguientes describen las acciones articulares existentes.
+La acción `PlanBimanualCartesianTrajectory` planifica el *facing* de ambas herramientas; su configuración, backends y activación manual se describen en [la guía bimanual](docs/bimanual_cartesian_planner.md). Los apartados siguientes describen las acciones articulares existentes.
 
 El nodo principal es un `LifecycleNode` que expone una action propia, `PlanJointTrajectory`, para mandar una pose predefinida o una posicion objetivo de 4 articulaciones a un brazo. El servidor:
 
@@ -303,8 +305,8 @@ La configuracion `rviz/manipulation_planning.rviz` incluye:
 - `MotionPlanning`: planning scene en `/cirtesub/moveit/monitored_planning_scene`
 - Un único display `MarkerArray` en `/cirtesub/manipulation/markers`: cada acción
   cartesiana publica sus poses y líneas juntas en un solo mensaje.
-  Planificado verde, deseado violeta; en bimanual incluye brazo A cian y brazo B
-  naranja, sin prioridad entre brazos. Las acciones articulares usan también este
+  En un brazo, planificado verde y deseado violeta; en bimanual (facing), brazo
+  izquierdo cian, derecho naranja y la línea entre herramientas violeta. Las acciones articulares usan también este
   tópico para el debug de colisiones.
 
 Las acciones cartesianas muestran ejes X rojo, Y verde y Z azul en el objetivo

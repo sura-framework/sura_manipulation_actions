@@ -1,4 +1,5 @@
 #include "sura_manipulation_actions/cartesian_pose_path.hpp"
+#include "sura_manipulation_actions/progress_nominal.hpp"
 #include "sura_manipulation_actions/cartesian_tracking.hpp"
 
 #include <gtest/gtest.h>
@@ -261,3 +262,49 @@ TEST(CartesianTrackingTest, ActivationIsAppliedInWorldBeforeRotatingToleranceAxe
 
 }  // namespace
 }  // namespace sura_manipulation_actions
+
+TEST(CartesianPosePathProgress, FrozenThenMovingIncludingPureRotation)
+{
+  using sura_manipulation_actions::CartesianPosePath;
+  Eigen::Isometry3d start = Eigen::Isometry3d::Identity(), end = start;
+  end.linear() = Eigen::AngleAxisd(1.2, Eigen::Vector3d::UnitY()).toRotationMatrix();
+  CartesianPosePath slow, fast;
+  std::string reason;
+  ASSERT_TRUE(slow.init(start, end, .2, .1, .3, .2, .01, .01, 1000, reason));
+  ASSERT_TRUE(fast.init(start, end, .2, .4, .3, .8, .01, .01, 1000, reason));
+  ASSERT_NE(slow.duration(), fast.duration());
+  for (double s : {0.4, 0.4, 0.4, 0.5, 0.6, 0.55}) {
+    EXPECT_TRUE(slow.atProgress(s).matrix().isApprox(fast.atProgress(s).matrix()));
+    EXPECT_NEAR(Eigen::AngleAxisd(slow.atProgress(s).rotation()).angle(), s * 1.2, 1e-12);
+  }
+  EXPECT_NEAR(slow.progressTangent()(4), 1.2, 1e-12);
+  EXPECT_DOUBLE_EQ(slow.timedProgress(0.5 * slow.duration()), 0.5);
+}
+
+TEST(CartesianPosePathProgress, NominalRetimingFrozenAndReversed)
+{
+  using namespace sura_manipulation_actions;
+  std::string error;
+  auto make = [&](std::vector<double> times) {
+    std::vector<BaseCoordinates> base(3,BaseCoordinates::Zero());
+    base[1](5) = 0.5; base[2](5) = 1.0;
+    std::vector<Eigen::VectorXd> joints;
+    for (double q : {0.0,0.7,1.0}) {joints.push_back(Eigen::VectorXd::Constant(1,q));}
+    trajectory_msgs::msg::JointTrajectory j;
+    trajectory_msgs::msg::MultiDOFJointTrajectory b;
+    EXPECT_TRUE(buildWholeBodyNominal(times,base,joints,{"elbow"},"world",j,b,error));
+    ProgressNominal path;
+    EXPECT_TRUE(path.init(j,b,{0.0,0.25,1.0},error)) << error;
+    return path;
+  };
+  auto a = make({0,1,4}), b = make({0,7,12});
+  for (double s : {0.4,0.4,0.4,0.6,0.55}) {
+    const auto frozen = a.sample(s,0);
+    const auto forward = b.sample(s,0.2), backward = b.sample(s,-0.2);
+    EXPECT_TRUE(frozen.pose.isApprox(forward.pose));
+    EXPECT_TRUE(frozen.joints.isApprox(forward.joints));
+    EXPECT_TRUE(frozen.joint_velocities.isZero());
+    EXPECT_TRUE(forward.joint_velocities.isApprox(-backward.joint_velocities));
+    EXPECT_NEAR(forward.twist.angular.z,-backward.twist.angular.z,1e-12);
+  }
+}

@@ -103,6 +103,21 @@ public:
     return true;
   }
 
+  // Geometric coordinate of the analytic (translation + signed SLERP) path.
+  Eigen::Isometry3d atProgress(double s) const {return interpolate(s);}
+  Velocity progressTangent() const
+  {
+    Velocity tangent;
+    tangent << target_.translation() - start_.translation(), angular_displacement_;
+    return tangent;
+  }
+  double timedProgress(double elapsed) const
+  {
+    if (duration_ == 0.0 || elapsed >= duration_) {return 1.0;}
+    const double u = std::clamp(elapsed / duration_, 0.0, 1.0);
+    return u * u * u * (10.0 + u * (-15.0 + 6.0 * u));
+  }
+
   double duration() const {return duration_;}
 
   msg::CartesianPoseTrajectory descriptor(const std::string & frame) const
@@ -198,9 +213,7 @@ public:
     if (!times_.empty()) {return sampledPose(elapsed);}
     if (duration_ == 0.0 || elapsed >= duration_) {return target_;}
     if (!std::isfinite(elapsed) || elapsed <= 0.0) {return start_;}
-    const double u = elapsed / duration_;
-    const double progress = u * u * u * (10.0 + u * (-15.0 + 6.0 * u));
-    return interpolate(progress);
+    return atProgress(timedProgress(elapsed));
   }
 
   // Linear velocity at the tool origin and spatial angular velocity, both

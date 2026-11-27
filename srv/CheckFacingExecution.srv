@@ -1,0 +1,12 @@
+# Readiness of the task-priority hierarchy for a facing execution. Read-only.
+# facing_task must be an enabled EndEffectorsFacingTask on these tool frames, nominal_task
+# an enabled RobotNominalTask below it in priority, and disabled_tasks must be disabled.
+string facing_task
+string nominal_task
+string left_frame
+string right_frame
+float64 min_distance
+string[] disabled_tasks
+---
+bool success
+string message

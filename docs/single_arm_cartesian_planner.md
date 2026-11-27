@@ -83,6 +83,31 @@ Las tolerancias de seguimiento se toman del goal, sin un límite cartesiano adic
 en el controlador. Con `use_stpik: false` se omite el check previo y se mantiene
 la supervisión del tracking durante la ejecución.
 
+## Planificar la pose de la punta (`use_offset`, backend Pose)
+
+Si la tarea de pose del brazo (`pose_task`, p. ej. `right_pose`) tiene `use_offset: true` en el controlador
+(ver `task_priority_kinematic_control`), el backend **Pose** trabaja con el **punto controlado**, por ejemplo la
+punta de una brida sujeta por la pinza, y no con `standard_jaws_tool`:
+
+- `target_pose` es la pose deseada **de la punta**.
+- La pose inicial del recorrido geométrico, los objetivos de mantenimiento y la comprobación de seguimiento
+  usan `T_tool · T_tool→punta`, con el offset recibido en el topic de la tarea
+  (`<prefijo de la tarea>/offset`, `PoseStamped` en el frame del tool; se deriva de `pose_target_topic`, o se fija
+  con `arms.<arm>.pose_offset_topic`).
+- El feedforward es la derivada del recorrido de la punta, es decir, la velocidad del punto controlado.
+- La validación STPIK usa el offset tal como estaba al capturar la instantánea (congelado durante la simulación).
+
+Cómo usarlo: pon `ros2 param set <controlador> tasks.<pose_task>.use_offset true` (solo se acepta con un offset
+reciente) y envía el goal de siempre. Reglas de seguridad:
+
+- Sin offset reciente (más viejo que `pose.offset_max_age`, 0.5 s por defecto) el goal **falla** con
+  `No tip offset received` o `Tip offset ... is stale`; nunca se planifica para el tool en silencio.
+- `use_offset` se lee al planificar y al ejecutar. Si cambia entre los dos, la ejecución se rechaza (`use_offset of
+  the pose task changed since planning`): el plan queda retenido y hay que repetirlo o restaurar el valor.
+- Si el offset caduca durante la ejecución, la tarea queda inactiva y la comprobación de seguimiento aborta el
+  movimiento.
+- Los backends `controller` y `task` (MoveIt) y el planificador bimanual siguen planificando para el tool.
+
 ## Preparación de la postura inicial con OSQP
 
 En el backend **Pose**, marca **Optimize initial posture (OSQP)** y deja **Execute after planning**

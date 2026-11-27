@@ -8,7 +8,10 @@
 
 #include <Eigen/Geometry>
 
+#include "sura_manipulation_actions/facing_geometry.hpp"
+
 #include <functional>
+#include <limits>
 #include <map>
 #include <string>
 #include <utility>
@@ -39,8 +42,25 @@ struct Pair
   std::string task_manager_service;
 };
 
+// Bimanual goal: arm A (left) and arm B (right) face each other. Axes are pure signed
+// axes of each tool frame; see facing_geometry.hpp for the row definitions.
+struct FacingGoal
+{
+  Eigen::Vector3d left_pointing_axis = Eigen::Vector3d::UnitX();
+  Eigen::Vector3d right_pointing_axis = Eigen::Vector3d::UnitX();
+  // NaN keeps the measured roll.
+  double roll = std::numeric_limits<double>::quiet_NaN();
+  double distance = 0.0;
+  double pointing_tolerance = 0.0;
+  double roll_tolerance = 0.0;
+  double distance_tolerance = 0.0;
+};
+
+// GoalSpec::facing drives the bimanual planner. The remaining Cartesian target and
+// tolerance fields belong to the single-arm planner.
 struct GoalSpec
 {
+  FacingGoal facing;
   // Empty selects the model frame. The reference must not move with either arm.
   std::string reference_frame;
   // p = p_arm_b - p_arm_a, R = R_arm_b * R_arm_a^T in reference axes.
@@ -87,6 +107,11 @@ struct Options
   double validation_time_step = 0.01;
   double velocity_scaling = 0.1;
   double acceleration_scaling = 0.1;
+  // Facing: closer tools make the line between them (and the task) undefined.
+  double facing_min_distance = 0.02;
+  // Facing: progress fraction used to reach the pointing axes and the roll before the
+  // distance changes; 0 changes everything simultaneously.
+  double facing_orientation_fraction = 0.4;
   double position_epsilon = 1.0e-6;
   double orientation_epsilon = 1.0e-6;
   bool optimize_trajectory = true;
@@ -113,6 +138,11 @@ struct PlannedTrajectory
   Eigen::Isometry3d initial_arm_a_pose = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d initial_relative_pose = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d relative_target = Eigen::Isometry3d::Identity();
+  // Bimanual only: the facing reference as a function of progress (path knots), from the
+  // measured configuration to the goal; progress_values places each waypoint on it.
+  facing::PureAxis facing_left_goal, facing_right_goal;
+  facing::Reference facing_start, facing_target;
+  std::vector<facing::Knot> facing_path;
 };
 
 class BimanualCartesianPlanner

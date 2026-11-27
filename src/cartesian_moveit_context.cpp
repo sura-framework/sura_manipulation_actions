@@ -158,6 +158,24 @@ bool CartesianMoveItContext::snapshot(
   return false;
 }
 
+bool CartesianMoveItContext::jointPositions(
+  const std::vector<std::string> & joint_names, double max_age,
+  std::vector<double> & positions, std::string & error) const
+{
+  positions.clear();
+  std::lock_guard<std::mutex> lock(observation_mutex_);
+  const auto current = node_->now();
+  for (const auto & name : joint_names) {
+    const auto it = observations_.find(name);
+    if (it == observations_.end() || std::abs((current - it->second.stamp).seconds()) > max_age) {
+      error = "Missing or stale joint state: " + name;
+      return false;
+    }
+    positions.push_back(it->second.position);
+  }
+  return true;
+}
+
 bool CartesianMoveItContext::transformTarget(
   planning_scene::PlanningScenePtr & scene,
   const geometry_msgs::msg::PoseStamped & target, double max_age,

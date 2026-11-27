@@ -133,8 +133,31 @@ bool PlanCartesianTrajectoryActionServer::loadConfiguration(std::string & error)
   pose_angular_velocity_ = parameter<double>(*this, "pose.max_angular_velocity", 0.5);
   pose_linear_acceleration_ = parameter<double>(*this, "pose.max_linear_acceleration", 0.4);
   pose_angular_acceleration_ = parameter<double>(*this, "pose.max_angular_acceleration", 0.2);
+  require_tip_offset_ = parameter<bool>(*this, "local_planner.require_tip_offset", false);
+  predictive_enabled_ = parameter<bool>(*this, "local_planner.enabled", false);
+  prediction_period_ = parameter<double>(*this, "local_planner.period", 0.25);
+  auto & settings = prediction_settings_;
+  settings.explore = parameter<bool>(*this, "local_planner.explore", true);
+  settings.progress_rate_scale = parameter<double>(*this, "local_planner.progress_rate_scale", 1.0);
+  settings.horizon = parameter<double>(*this, "local_planner.horizon", settings.horizon);
+  settings.budget = parameter<double>(*this, "local_planner.budget", settings.budget);
+  settings.retreat_window = parameter<double>(*this, "local_planner.retreat_window", settings.retreat_window);
+  settings.gain = parameter<double>(*this, "local_planner.gain", settings.gain);
+  settings.amplitude = parameter<double>(*this, "local_planner.amplitude", settings.amplitude);
+  settings.position_scale = parameter<double>(*this, "local_planner.position_scale", settings.position_scale);
+  settings.angle_scale = parameter<double>(*this, "local_planner.angle_scale", settings.angle_scale);
+  settings.recovery_threshold = parameter<double>(*this, "local_planner.recovery_threshold", settings.recovery_threshold);
+  settings.improvement = parameter<double>(*this, "local_planner.improvement", settings.improvement);
+  const auto weights = parameter<std::vector<double>>(*this, "local_planner.weights",
+    std::vector<double>(settings.weights.begin(), settings.weights.end()));
+  if (weights.size() != settings.weights.size() ||
+    std::any_of(weights.begin(),weights.end(),[](double w){return !std::isfinite(w) || w < 0;})) {
+    error = "local_planner.weights requires six finite nonnegative weights"; return false;
+  }
+  std::copy(weights.begin(),weights.end(),settings.weights.begin());
   stpik_timeout_ = parameter<double>(*this, "pose.stpik_timeout", 35.0);
-  const std::vector<double> positive{planning_time_, cartesian_step_, state_timeout_, state_max_age_,
+  pose_offset_max_age_ = parameter<double>(*this, "pose.offset_max_age", 0.5);
+  const std::vector<double> positive{prediction_period_, pose_offset_max_age_, planning_time_, cartesian_step_, state_timeout_, state_max_age_,
     start_joint_tolerance_, start_prismatic_tolerance_, base_position_tolerance_, base_orientation_tolerance_,
     pose_linear_velocity_, pose_angular_velocity_, pose_linear_acceleration_, pose_angular_acceleration_, stpik_timeout_};
   if (std::any_of(positive.begin(), positive.end(), [](double value) {return !std::isfinite(value) || value <= 0.0;})) {
@@ -254,6 +277,7 @@ bool PlanCartesianTrajectoryActionServer::loadConfiguration(std::string & error)
       feedforward_prefix.resize(feedforward_prefix.size() - 7);
     } else {feedforward_prefix = pose_prefix;}
     pose.feedforward_topic = parameter<std::string>(*this, prefix + "pose_feedforward_topic", feedforward_prefix + "/feedforward");
+    pose.offset_topic = parameter<std::string>(*this, prefix + "pose_offset_topic", feedforward_prefix + "/offset");
     const auto tasks_separator = pose.target_topic.rfind("/tasks/");
     pose.check_action = parameter<std::string>(*this, prefix + "pose_stpik_action",
       (tasks_separator == std::string::npos ? pose_namespace + "/task_priority" :
@@ -309,6 +333,36 @@ PlanCartesianTrajectoryActionServer::on_configure(const rclcpp_lifecycle::State 
         entry.second.feedforward_topic, rclcpp::QoS(1).reliable());
       entry.second.nominal = moveit_node_->create_publisher<msg::RobotNominalReference>(
         entry.second.nominal_topic, rclcpp::QoS(1).reliable());
+      entry.second.parameters = moveit_node_->create_client<rcl_interfaces::srv::GetParameters>(
+        entry.second.controller_node + "/get_parameters");
+      // Offset of the controlled point (tip pose in the task frame), the same topic the pose task listens to.
+      entry.second.offset_subscription = moveit_node_->create_subscription<geometry_msgs::msg::PoseStamped>(
+        entry.second.offset_topic, rclcpp::QoS(1).reliable(),
+        [state = entry.second.offset, tip_frame = arms_.at(entry.first).tip_frame, logger = get_logger(),
+        clock = get_clock()](const geometry_msgs::msg::PoseStamped::SharedPtr message) {
+          if (!message) {return;}
+          const auto & p = message->pose.position;
+          const auto & o = message->pose.orientation;
+          Eigen::Quaterniond rotation(o.w, o.x, o.y, o.z);
+          if (!message->header.frame_id.empty() && message->header.frame_id != tip_frame) {
+            RCLCPP_WARN_THROTTLE(logger, *clock, 2000, "Tip offset ignored: expressed in '%s', expected '%s'",
+              message->header.frame_id.c_str(), tip_frame.c_str());
+            return;
+          }
+          if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
+            !rotation.coeffs().allFinite() || rotation.norm() < 1e-6)
+          {
+            RCLCPP_WARN_THROTTLE(logger, *clock, 2000, "Tip offset ignored: invalid pose");
+            return;
+          }
+          Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+          pose.translation() << p.x, p.y, p.z;
+          pose.linear() = rotation.normalized().toRotationMatrix();
+          std::scoped_lock lock(state->mutex);
+          state->pose = pose;
+          state->received = std::chrono::steady_clock::now();
+          state->valid = true;
+        });
     }
     const auto & model = context_->model();
     if (reference_frame_ != model->getModelFrame()) {
@@ -364,6 +418,13 @@ PlanCartesianTrajectoryActionServer::on_configure(const rclcpp_lifecycle::State 
       {throw std::runtime_error("reference_frame must be independent of the selected arm");}
     }
     if (fixed_frame_.empty()) {fixed_frame_ = model->getModelFrame();}
+    const auto path_qos = rclcpp::QoS(1).reliable().transient_local();
+    local_path_pub_ = moveit_node_->create_publisher<visualization_msgs::msg::MarkerArray>(
+      topic("manipulation/local_path"), path_qos);
+    local_base_path_pub_ = moveit_node_->create_publisher<nav_msgs::msg::Path>(
+      topic("manipulation/local_base_path"), path_qos);
+    predicted_path_pub_ = moveit_node_->create_publisher<nav_msgs::msg::Path>(
+      topic("manipulation/local_predicted_path"), path_qos);
     visualization_ = std::make_unique<CartesianTrajectoryVisualization>(
       moveit_node_, topic("cartesian_planner"), topic("manipulation"), fixed_frame_,
       parameter<bool>(*this, "visualization.publish_paths", true),
@@ -434,7 +495,12 @@ bool PlanCartesianTrajectoryActionServer::validateGoal(
     error = "Choose either optimize_initial_posture or optimize_trajectory_nominal; "
       "the whole-trajectory optimization already optimizes the initial posture"; return false;
   }
+  if (goal.use_predictive_local_planner && !goal.optimize_trajectory_nominal) {
+    error = "Predictive local planning requires optimize_trajectory_nominal"; return false;
+  }
   pending.wants_nominal = goal.optimize_trajectory_nominal;
+  pending.use_predictive_local_planner =
+    goal.use_predictive_local_planner || (predictive_enabled_ && pending.wants_nominal);
   for (const auto scaling : {goal.velocity_scaling, goal.acceleration_scaling}) {
     if (!std::isfinite(scaling) || scaling < 0.0 || scaling > 1.0) {
       error = "velocity_scaling and acceleration_scaling must be finite in [0, 1]; zero uses server defaults";
@@ -997,6 +1063,7 @@ void PlanCartesianTrajectoryActionServer::finish(
   result->message = message;
   result->joint_trajectory = pending->plan.joint_trajectory;
   result->base_trajectory = pending->plan.base_trajectory;
+  result->nominal_progress = pending->nominal_progress;
   result->base_path = pending->views.base_path;
   result->path = pending->views.arm_b_path;
   result->desired_path = pending->views.desired_relative_path;
@@ -1032,6 +1099,7 @@ void PlanCartesianTrajectoryActionServer::cleanupResources()
   if (context_) {context_->stop();}
   managers_.clear(); coordinated_client_.reset(); follow_dispatch_.reset(); clients_group_.reset();
   pose_endpoints_.clear(); pose_tf_listener_.reset(); pose_tf_buffer_.reset();
+  local_path_pub_.reset(); local_base_path_pub_.reset(); predicted_path_pub_.reset();
   executor_.reset(); visualization_.reset(); context_.reset(); moveit_node_.reset();
   arms_.clear(); tasks_.clear();
   planner_options_.tightened_limits.clear(); planner_options_.nominal_positions.clear();

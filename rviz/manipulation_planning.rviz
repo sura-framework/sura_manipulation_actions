@@ -52,6 +52,21 @@ Visualization Manager:
     Show Axes: false
     Show Descriptions: true
     Value: true
+  - Class: rviz_default_plugins/MarkerArray
+    Enabled: true
+    Name: Explored local paths
+    Topic:
+      Value: /cirtesub/manipulation/local_path
+      Durability Policy: Transient Local
+    Value: true
+  - Class: rviz_default_plugins/Path
+    Color: 194; 105; 237
+    Enabled: true
+    Name: Accepted local segment
+    Topic:
+      Value: /cirtesub/manipulation/local_predicted_path
+      Durability Policy: Transient Local
+    Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48

@@ -102,6 +102,7 @@ protected:
       fake_->declare_parameter(prefix + "frame_id", std::string(side) + "_tip");
       fake_->declare_parameter(prefix + "plugin", std::string("task_priority_kinematic_control/FramePoseTask"));
       fake_->declare_parameter(prefix + "auto_update_target_pose", true);
+      fake_->declare_parameter(prefix + "use_offset", false);
       fake_->declare_parameter(prefix + "activation", std::vector<int64_t>{});
     }
     dynamic_tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(fake_);
@@ -243,6 +244,26 @@ protected:
       }
       result->code = result->outcome == CheckAction::Result::FAIL ? "COLLISION_CLEARANCE" :
         result->outcome == CheckAction::Result::UNAVAILABLE ? "CHECK_UNAVAILABLE" : "SUCCESS";
+      if (!handle->get_goal()->prediction.global_progress.empty()) {
+        ++local_requests_;
+        result->segment.joints = handle->get_goal()->nominal_joints;
+        result->segment.base = handle->get_goal()->nominal_base;
+        result->segment.progress = handle->get_goal()->prediction.global_progress;
+        result->trace.resize(1);
+        result->trace.front().tip_pose.position.y = 0.123;
+        result->trace.front().tip_pose.orientation.w = 1.0;
+        result->explored_paths.resize(2);
+        for (auto & candidate : result->explored_paths) {
+          candidate.poses.assign(2, result->trace.front().tip_pose);
+        }
+        result->explored_paths[0].poses.back().position.y = 0.25;
+        result->explored_paths[0].rejoined = true;
+        result->explored_paths[1].poses.back().position.y = -0.25;
+        if (reject_local_.load()) {
+          result->outcome = result->FAIL;
+          result->code = "NO_LOCAL_CONTINUATION";
+        }
+      }
       result->message = "fixture check"; result->validation_id = 42;
       if (stalled_check_.load() && result->outcome == CheckAction::Result::FAIL) {
         result->code = "STALLED"; result->constraint = "position";
@@ -500,6 +521,8 @@ protected:
   rclcpp::Subscription<moveit_msgs::msg::DisplayTrajectory>::SharedPtr display_sub_;
   std::atomic_bool backend_active_{false}, task_enabled_{true};
   std::atomic_bool controller_tracks_{true}, hold_coordinated_{false};
+  std::atomic_int local_requests_{0};
+  std::atomic_bool reject_local_{false};
   std::atomic_bool pose_tracks_{true};
   std::atomic_int backend_requests_{0}, switch_requests_{0}, backend_cancels_{0};
   std::atomic_int visual_refreshes_{0};
@@ -908,6 +931,88 @@ TEST_F(SingleCartesianActionServerTest, WholeBodyNominalIsPlannedCheckedAndStrea
   EXPECT_DOUBLE_EQ(references.back().velocities.at(0), 0.0);
 }
 
+class PredictivePoseExecution : public SingleCartesianActionServerTest
+{
+protected:
+  void runPredictiveGoal(bool reject)
+  {
+    using Prepare = sura_manipulation_actions::action::PrepareCartesianPosture;
+    using ServerHandle = rclcpp_action::ServerGoalHandle<Prepare>;
+    reject_local_ = reject;
+    std::atomic_size_t base_knots{0};
+    std::atomic_bool explored_paths_received{false};
+    std::atomic_bool predicted_pose_received{false};
+    const auto path_qos = rclcpp::QoS(1).transient_local();
+    auto predicted_path = fake_->create_subscription<nav_msgs::msg::Path>(
+      ns_ + "/manipulation/local_predicted_path", path_qos,
+      [&](nav_msgs::msg::Path::ConstSharedPtr path) {
+        predicted_pose_received = path->header.frame_id == "base" &&
+          path->poses.size() == 1 && path->poses.front().pose.position.y == 0.123;
+      });
+    using Marker = visualization_msgs::msg::Marker;
+    auto explored_paths = fake_->create_subscription<visualization_msgs::msg::MarkerArray>(
+      ns_ + "/manipulation/local_path", path_qos,
+      [&](visualization_msgs::msg::MarkerArray::ConstSharedPtr message) {
+        const auto & markers = message->markers;
+        if (markers.size() != 3) {return;}
+        explored_paths_received = markers[0].action == Marker::DELETEALL &&
+          markers[1].header.frame_id == "base" && markers[1].type == Marker::LINE_STRIP &&
+          markers[2].type == Marker::LINE_STRIP && markers[1].points.size() == 2 &&
+          markers[2].points.size() == 2 && markers[1].points.back().y == 0.25 &&
+          markers[2].points.back().y == -0.25;
+      });
+    auto base_path = fake_->create_subscription<nav_msgs::msg::Path>(
+      ns_ + "/manipulation/local_base_path", path_qos,
+      [&](nav_msgs::msg::Path::ConstSharedPtr path) {base_knots = path->poses.size();});
+    auto prepare = rclcpp_action::create_server<Prepare>(fake_, ns_ + "/task_priority/prepare_cartesian_posture",
+      [](const auto &, auto){return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;},
+      [](auto){return rclcpp_action::CancelResponse::ACCEPT;},
+      [](std::shared_ptr<ServerHandle> h) {
+        auto result = std::make_shared<Prepare::Result>();
+        result->success = true; result->proposal.preparation_id = 1;
+        result->nominal_progress = {0.0,1.0};
+        std::string error;
+        using namespace sura_manipulation_actions;
+        EXPECT_TRUE(buildWholeBodyNominal({0.0,0.15}, {BaseCoordinates::Zero(),BaseCoordinates::Zero()},
+          {Eigen::Vector2d::Zero(),Eigen::Vector2d::Zero()},{"left_joint","right_joint"},"base",
+          result->nominal_joints,result->nominal_base,error));
+        h->succeed(result);
+      });
+    auto sub = fake_->create_subscription<sura_manipulation_actions::msg::RobotNominalReference>(
+      ns_ + "/task_priority/tasks/robot_nominal/reference",10,[](sura_manipulation_actions::msg::RobotNominalReference::ConstSharedPtr) {});
+    backend_active_.store(true);
+    auto request = poseGoal(true);
+    request.optimize_trajectory_nominal = true;
+    request.use_predictive_local_planner = true;
+    auto handle = sendGoal(request);
+    ASSERT_TRUE(handle);
+    auto future = client_->async_get_result(handle);
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(8)), std::future_status::ready);
+    auto result = future.get().result;
+    ASSERT_TRUE(result);
+    EXPECT_GT(local_requests_.load(),0);
+    EXPECT_EQ(result->success,!reject) << result->message;
+    EXPECT_TRUE(waitUntil([&] {return explored_paths_received.load();}));
+    if (reject) {
+      EXPECT_EQ(base_knots.load(), 0u);
+      EXPECT_FALSE(predicted_pose_received);
+    } else {
+      EXPECT_TRUE(waitUntil([&] {return base_knots == 2 && predicted_pose_received;}));
+    }
+    if (reject) {EXPECT_NE(result->message.find("NO_LOCAL_CONTINUATION"),std::string::npos);}
+    EXPECT_EQ(backend_requests_.load(),0);
+  }
+};
+TEST_F(PredictivePoseExecution, StreamsValidatedSegment) {runPredictiveGoal(false);}
+TEST_F(PredictivePoseExecution, ReportsNoContinuation) {runPredictiveGoal(true);}
+
+TEST_F(SingleCartesianActionServerTest, PredictiveGoalRequiresWholeBodyNominal)
+{
+  auto request = poseGoal();
+  request.use_predictive_local_planner = true;
+  EXPECT_FALSE(sendGoal(request));
+}
+
 TEST_F(SingleCartesianActionServerTest, WholeBodyNominalRequiresPoseAndStpik)
 {
   auto request = poseGoal();
@@ -1107,6 +1212,79 @@ TEST_F(SingleCartesianActionServerTest, PoseExecutionRetainsPendingPlanWhenTaskF
   EXPECT_TRUE(finished.result->success) << finished.result->message;
   EXPECT_TRUE(automaticTarget());
   EXPECT_EQ(backend_requests_.load(), 0);
+}
+
+// With use_offset on the pose task, the pose path starts at the tip (tool pose * offset) and ends at the
+// target, which is then a tip pose.
+TEST_F(SingleCartesianActionServerTest, PosePlanStartsAtTheTipWhenThePoseTaskUsesAnOffset)
+{
+  ASSERT_TRUE(fake_->set_parameter(rclcpp::Parameter("tasks.left_pose.use_offset", true)).successful);
+  auto offset_publisher = fake_->create_publisher<geometry_msgs::msg::PoseStamped>(
+    ns_ + "/task_priority/tasks/left_pose/offset", rclcpp::QoS(1).reliable());
+  auto offset_timer = fake_->create_wall_timer(std::chrono::milliseconds(20), [offset_publisher]() {
+    geometry_msgs::msg::PoseStamped offset;
+    offset.header.frame_id = "left_tip";
+    offset.pose.position.z = 0.2;
+    offset.pose.orientation.w = 1.0;
+    offset_publisher->publish(offset);
+  });
+  auto handle = sendGoal(poseGoal());
+  ASSERT_TRUE(handle);
+  auto result = client_->async_get_result(handle);
+  ASSERT_TRUE(waitUntil([this]() {return waiting();}));
+  auto canceled = client_->async_cancel_goal(handle);
+  ASSERT_EQ(canceled.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  ASSERT_EQ(result.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  const auto finished = result.get();
+  ASSERT_TRUE(finished.result);
+  const auto & path = finished.result->desired_path;
+  ASSERT_GE(path.poses.size(), 2u);
+  double tool_z = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(observation_mutex_);
+    tool_z = measured_poses_[0].position.z;
+  }
+  EXPECT_NEAR(path.poses.front().pose.position.x, -1.0, 1e-9);
+  EXPECT_NEAR(path.poses.front().pose.position.z, tool_z + 0.2, 1e-9);  // tip, not tool
+  EXPECT_NEAR(path.poses.back().pose.position.x, -0.99, 1e-9);
+  EXPECT_NEAR(path.poses.back().pose.position.z, 0.0, 1e-9);            // the target as given
+  offset_timer->cancel();
+}
+
+TEST_F(SingleCartesianActionServerTest, PosePlanFailsWithoutAnOffsetWhenThePoseTaskUsesOne)
+{
+  ASSERT_TRUE(fake_->set_parameter(rclcpp::Parameter("tasks.left_pose.use_offset", true)).successful);
+  auto handle = sendGoal(poseGoal());
+  ASSERT_TRUE(handle);
+  auto result = client_->async_get_result(handle);
+  ASSERT_EQ(result.wait_for(std::chrono::seconds(8)), std::future_status::ready);
+  const auto finished = result.get();
+  ASSERT_TRUE(finished.result);
+  EXPECT_FALSE(finished.result->success);
+  EXPECT_NE(finished.result->message.find("No tip offset received"), std::string::npos)
+    << finished.result->message;
+  std::lock_guard<std::mutex> lock(observation_mutex_);
+  EXPECT_TRUE(pose_targets_[0].empty());
+}
+
+TEST_F(SingleCartesianActionServerTest, PoseExecutionRefusesWhenUseOffsetChangedSincePlanning)
+{
+  backend_active_.store(true);
+  auto handle = sendGoal(poseGoal());
+  ASSERT_TRUE(handle);
+  auto result = client_->async_get_result(handle);
+  ASSERT_TRUE(waitUntil([this]() {return waiting();}));
+  ASSERT_TRUE(fake_->set_parameter(rclcpp::Parameter("tasks.left_pose.use_offset", true)).successful);
+  auto executed = trigger(execute_);
+  ASSERT_TRUE(executed);
+  ASSERT_TRUE(waitUntil([this]() {return waiting("use_offset");}));
+  {
+    std::lock_guard<std::mutex> lock(observation_mutex_);
+    EXPECT_TRUE(pose_targets_[0].empty());
+  }
+  auto canceled = client_->async_cancel_goal(handle);
+  ASSERT_EQ(canceled.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  EXPECT_EQ(result.wait_for(std::chrono::seconds(2)), std::future_status::ready);
 }
 
 TEST_F(SingleCartesianActionServerTest, PoseExecutionIgnoresMaskedOrientationForBothArms)
