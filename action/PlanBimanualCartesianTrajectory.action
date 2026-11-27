@@ -35,6 +35,10 @@ bool optimize_trajectory_nominal false
 # distance changes; 0 changes everything simultaneously. Negative uses the server's
 # planning.facing_orientation_fraction.
 float64 facing_orientation_fraction -1.0
+# Distance between both tools [m] to reach at the end of the orientation phase; the rest
+# of the path then goes from it to `distance`. Negative keeps the measured distance.
+# Ignored when the orientation fraction is 0.
+float64 orientation_phase_distance -1.0
 ---
 bool success
 string message

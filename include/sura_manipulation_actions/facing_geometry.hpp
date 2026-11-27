@@ -398,19 +398,24 @@ inline void changes(const Reference & from, const Reference & to, double & dista
 // change it has two stages: up to s = fraction the pointing axes and the roll reach the goal
 // at the start distance; then only the distance changes. Each stage is eased (zero rate at its
 // ends) through intermediate knots, so linear interpolation between knots keeps it, and there
-// is an exact knot at s = fraction. Changes below min_angle [rad] or min_distance [m] do not
+// is an exact knot at s = fraction. A positive stage_distance is reached during the first
+// stage instead of keeping the start distance, and always creates both stages. Changes below min_angle [rad] or min_distance [m] do not
 // get a stage of their own. `used` receives the stage boundary, or 0 when simultaneous.
 inline std::vector<Knot> stagedKnots(
   const Reference & from, const Reference & to, double fraction, double * used = nullptr,
-  double min_angle = 0.05, double min_distance = 0.002, int knots_per_stage = 8)
+  double min_angle = 0.05, double min_distance = 0.002, int knots_per_stage = 8,
+  double stage_distance = -1.0)
 {
   double distance = 0.0, angle = 0.0;
   changes(from, to, distance, angle);
-  const bool staged = fraction > 0.0 && fraction < 1.0 && distance >= min_distance && angle >= min_angle;
+  // A requested distance at the boundary always creates both stages.
+  const bool requested = stage_distance > 0.0;
+  const bool staged = fraction > 0.0 && fraction < 1.0 &&
+    (requested || (distance >= min_distance && angle >= min_angle));
   if (used) {*used = staged ? fraction : 0.0;}
   if (!staged) {return {{0.0, from}, {1.0, to}};}
   Reference oriented = to;
-  oriented.distance = from.distance;
+  oriented.distance = requested ? stage_distance : from.distance;
   std::vector<Knot> out{{0.0, from}};
   const auto stage = [&](const Reference & a, const Reference & b, double s0, double s1) {
       for (int i = 1; i <= knots_per_stage; ++i) {

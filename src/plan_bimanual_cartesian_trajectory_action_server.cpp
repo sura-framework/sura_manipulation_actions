@@ -150,6 +150,18 @@ bool PlanBimanualCartesianTrajectoryActionServer::loadConfiguration(std::string 
   if (!std::isfinite(p.facing_min_distance) || p.facing_min_distance <= 0.0) {
     error = "planning.facing_min_distance must be finite and positive"; return false;
   }
+  p.facing_joint_phase = parameter<bool>(*this, "planning.facing_joint_orientation_phase", true);
+  p.facing_phase_distance_margin = parameter<double>(*this, "planning.facing_phase_distance_margin", 0.05);
+  p.facing_phase_max_distance = parameter<double>(*this, "planning.facing_phase_max_distance", 0.0);
+  p.facing_phase_pointing_margin = parameter<double>(*this, "planning.facing_phase_pointing_margin", 0.35);
+  p.facing_phase_roll_margin = parameter<double>(*this, "planning.facing_phase_roll_margin", 0.35);
+  for (const double value : {p.facing_phase_distance_margin, p.facing_phase_max_distance,
+    p.facing_phase_pointing_margin, p.facing_phase_roll_margin})
+  {
+    if (!std::isfinite(value) || value < 0.0) {
+      error = "planning.facing_phase_* limits must be finite and non-negative"; return false;
+    }
+  }
   const auto limit_names = parameter<std::vector<std::string>>(*this, "planning.limit_joint_names", {});
   const auto lower = parameter<std::vector<double>>(*this, "planning.lower_limits", {});
   const auto upper = parameter<std::vector<double>>(*this, "planning.upper_limits", {});
@@ -439,6 +451,12 @@ bool PlanBimanualCartesianTrajectoryActionServer::validateGoal(
   if (goal.facing_orientation_fraction >= 0.0) {
     pending.options.facing_orientation_fraction = goal.facing_orientation_fraction;
   }
+  if (!std::isfinite(goal.orientation_phase_distance) || (goal.orientation_phase_distance >= 0.0 &&
+    goal.orientation_phase_distance < pending.options.facing_min_distance))
+  {
+    error = "orientation_phase_distance must be negative or at least planning.facing_min_distance";
+    return false;
+  }
   auto & spec = pending.goal;
   spec.reference_frame = relative_reference_frame_;
   auto & facing_goal = spec.facing;
@@ -446,6 +464,7 @@ bool PlanBimanualCartesianTrajectoryActionServer::validateGoal(
   facing_goal.right_pointing_axis = vector(goal.right_pointing_axis);
   facing_goal.roll = goal.roll_angle;
   facing_goal.distance = goal.distance;
+  facing_goal.orientation_phase_distance = goal.orientation_phase_distance;
   facing_goal.pointing_tolerance = goal.pointing_tolerance;
   facing_goal.roll_tolerance = goal.roll_tolerance;
   facing_goal.distance_tolerance = goal.distance_tolerance;
@@ -659,7 +678,7 @@ bool PlanBimanualCartesianTrajectoryActionServer::planOptimized(
       pending->options.facing_min_distance, from, to, error))
   {return false;}
   const auto knots = facing::stagedKnots(from, to, pending->options.facing_orientation_fraction,
-    nullptr, pending->options.angular_step);
+    nullptr, pending->options.angular_step, 0.002, 8, request.orientation_phase_distance);
   if (!facing_.preparer->wait_for_action_server(std::chrono::seconds(2))) {
     error = "Controller planning action unavailable: " + facing_.prepare_action; return false;
   }

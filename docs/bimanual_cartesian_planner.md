@@ -56,6 +56,10 @@ La velocidad se elige antes de planificar; para cambiarla en un plan pendiente, 
 
 `relative_reference_frame` (en Alpha `cirtesub/base_link`) debe ser un link que no se mueva con las articulaciones comandadas; en él se expresan paths y markers.
 
+**Distancia de la fase de orientación.** El campo `orientation_phase_distance` del goal es la distancia a la que debe llegarse al terminar la fase (`s = a`); desde ella la segunda fase va hasta `distance`. Negativo (por defecto) conserva la medida. Con `a = 0` se ignora.
+
+**Primera fase en espacio articular** (planner punto a punto, `planning.facing_joint_orientation_phase: true`). La primera fase no sigue una referencia impuesta: se busca una postura en `s = a` que cumpla el objetivo de orientación a esa distancia y desde la que la fase de distancia sea completable, y se une con la postura inicial en articulaciones (recta o RRT-Connect). En todo ese tramo se respetan límites articulares, colisiones y: distancia dentro de `facing_phase_distance_margin` de [inicial, fase] y nunca por encima de `facing_phase_max_distance` (0 = sin máximo); cada apuntado y el roll dentro de `facing_phase_pointing_margin` / `facing_phase_roll_margin` de su recorrido de inicio a objetivo. `facing_path` se calcula en ese tramo por cinemática directa sobre la trayectoria temporizada, así que facing, STPIK y la ejecución lo siguen igual que antes. El objeto que une las herramientas no se modela: estos límites son su única protección. El modo optimizado sigue imponiendo la referencia por tramos, con la distancia de fase pedida.
+
 ## Optimización de toda la trayectoria (`optimize_trajectory_nominal`)
 
 Con este campo (casilla **Optimize whole trajectory (robot_nominal)** en RQT) el plan no lo calcula el IK punto a punto del servidor, sino el mismo planificador global que usa el modo de un brazo con `robot_nominal`, dentro del controlador (`task_priority/prepare_cartesian_posture`):

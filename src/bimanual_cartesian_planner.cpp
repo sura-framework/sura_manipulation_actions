@@ -11,6 +11,7 @@
 #include <Eigen/SVD>
 
 #include <algorithm>
+#include <random>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -326,15 +327,83 @@ public:
       request.distance, options.facing_min_distance, facing_start, facing_goal, error))
     {return false;}
     buildFacingPath();
-    return true;
+    return preparePhase(error);
   }
 
   // The staged reference between facing_start and facing_goal.
   void buildFacingPath()
   {
     std::string ignored;
+    // The joint-space phase needs an exact reference at the stage boundary.
     facing_path.init(facing::stagedKnots(facing_start, facing_goal,
-      options.facing_orientation_fraction, &facing_stage, options.angular_step), ignored);
+      options.facing_orientation_fraction, &facing_stage, options.angular_step, 0.002, 8,
+      options.facing_joint_phase ? phaseDistance() : goal.facing.orientation_phase_distance), ignored);
+  }
+
+  double phaseDistance() const
+  {
+    return goal.facing.orientation_phase_distance > 0.0 ?
+      goal.facing.orientation_phase_distance : facing_start.distance;
+  }
+
+  // Limits of the joint-space orientation phase, from the start and goal references.
+  bool preparePhase(std::string & error)
+  {
+    joint_phase = false;
+    const double fraction = options.facing_orientation_fraction;
+    if (!options.facing_joint_phase || !(fraction > 0.0 && fraction < 1.0)) {return true;}
+    double unused = 0.0, angle = 0.0;
+    facing::changes(facing_start, facing_goal, unused, angle);
+    const double target = phaseDistance();
+    if (angle < options.angular_step && std::abs(target - facing_start.distance) < 0.002) {return true;}
+    joint_phase = true;
+    facing_stage = fraction;
+    const double margin = options.facing_phase_distance_margin;
+    phase_min_distance = std::max(options.facing_min_distance,
+      std::min(facing_start.distance, target) - margin);
+    phase_max_distance = std::max(facing_start.distance, target) + margin;
+    if (options.facing_phase_max_distance > 0.0) {
+      if (std::max(facing_start.distance, target) > options.facing_phase_max_distance) {
+        error = "The start or orientation-phase distance exceeds planning.facing_phase_max_distance";
+        return false;
+      }
+      phase_max_distance = std::min(phase_max_distance, options.facing_phase_max_distance);
+    }
+    const auto between = [](const Eigen::Vector3d & a, const Eigen::Vector3d & b) {
+        return std::atan2(a.cross(b).norm(), a.dot(b));
+      };
+    phase_left_angle = options.facing_phase_pointing_margin +
+      std::max(between(facing_start.left_axis, facing_goal.left_axis), goal.facing.pointing_tolerance);
+    phase_right_angle = options.facing_phase_pointing_margin +
+      std::max(between(facing_start.right_axis, facing_goal.right_axis), goal.facing.pointing_tolerance);
+    // Roll errors between the initial one and zero, the short way round.
+    const double initial = facing::wrapAngle(facing_goal.roll - facing_start.roll);
+    phase_roll_center = 0.5 * initial;
+    phase_roll_half = 0.5 * std::abs(initial) + options.facing_phase_roll_margin +
+      goal.facing.roll_tolerance;
+    return true;
+  }
+
+  bool insidePhaseLimits(const Evaluation & current, std::string & error) const
+  {
+    static const Eigen::MatrixXd empty;
+    auto reference = facing_goal;
+    reference.distance = phaseDistance();
+    const auto rows = facing::evaluate(current.arm_a, current.arm_b, empty, empty,
+      left_goal, right_goal, reference, options.facing_min_distance);
+    if (!rows.valid) {error = "Tools are closer than the facing minimum distance"; return false;}
+    if (!rows.roll_valid) {error = "Facing roll is undefined along the path"; return false;}
+    const double distance = reference.distance - rows.error(5);
+    if (distance < phase_min_distance - options.position_epsilon ||
+      distance > phase_max_distance + options.position_epsilon)
+    {error = "Tool distance leaves the orientation-phase limits"; return false;}
+    if (rows.left_angle > phase_left_angle || rows.right_angle > phase_right_angle) {
+      error = "Tool pointing leaves the orientation-phase limits"; return false;
+    }
+    if (std::abs(facing::wrapAngle(rows.error(4) - phase_roll_center)) > phase_roll_half) {
+      error = "Relative roll leaves the orientation-phase limits"; return false;
+    }
+    return true;
   }
 
   facing::Rows facingRows(const Evaluation & current, double progress, bool jacobians) const
@@ -452,6 +521,8 @@ public:
         (residual.tail<3>().cwiseAbs().array() >
         goal.relative_orientation_tolerance.array() + options.orientation_epsilon).any())
       {error = "Tool pose is outside the Cartesian tolerances"; return false;}
+    } else if (joint_phase && progress < facing_stage - 1.0e-9) {
+      if (!insidePhaseLimits(current, error)) {return false;}
     } else {
       const auto rows = facingRows(current, progress, false);
       if (!rows.valid) {error = "Tools are closer than the facing minimum distance"; return false;}
@@ -621,6 +692,229 @@ public:
     const double midpoint = 0.5 * (previous.progress + target_progress);
     return appendSegment(points, midpoint, depth + 1, error) &&
            appendSegment(points, target_progress, depth + 1, error);
+  }
+
+  // Joint-space orientation phase followed by the distance phase on the facing path. Each
+  // candidate posture at the stage boundary must complete the distance phase first and then
+  // be connected to the start inside the phase limits.
+  bool planTwoPhases(std::vector<Waypoint> & points, std::string & error)
+  {
+    const auto final_deadline = deadline;
+    std::mt19937 random(7U);
+    const double distance = std::abs(facing_goal.distance - phaseDistance());
+    const int count = std::max(1, static_cast<int>(std::ceil(distance / goal.cartesian_step)));
+    if (count >= options.max_waypoints) {
+      error = "Requested Cartesian resolution exceeds the maximum waypoint count"; return false;
+    }
+    int postures = 0, completed = 0;
+    std::string posture_error = "none solved", distance_error, path_error;
+    for (int attempt = 0; attempt < 200; ++attempt) {
+      deadline = final_deadline;
+      if (stopped(error)) {break;}
+      if (feedback) {
+        feedback(0.1 + 0.6 * std::min(1.0, attempt / 20.0), "searching_orientation_phase_posture");
+      }
+      // One failing candidate must not consume the whole budget.
+      const auto now = std::chrono::steady_clock::now();
+      deadline = std::min(final_deadline, now + std::max<std::chrono::steady_clock::duration>(
+          (final_deadline - now) / 4, std::chrono::seconds(1)));
+      const Eigen::VectorXd seed = attempt == 0 ? q0 : randomPosture(random);
+      Eigen::VectorXd boundary;
+      if (!solveWaypoint(facing_stage, seed, seed, boundary, posture_error)) {continue;}
+      ++postures;
+      std::vector<Waypoint> second{{boundary, facing_stage}};
+      bool reached = true;
+      for (int i = 1; i <= count && reached; ++i) {
+        const double s = i == count ? 1.0 : facing_stage + (1.0 - facing_stage) * i / count;
+        reached = appendSegment(second, s, 0, distance_error);
+      }
+      if (!reached) {continue;}
+      ++completed;
+      deadline = final_deadline;
+      std::vector<Eigen::VectorXd> path;
+      if (!connectJoints(q0, boundary, random, path, path_error)) {continue;}
+      if (!phaseWaypoints(path, points, error)) {return false;}
+      points.insert(points.end(), second.begin() + 1, second.end());
+      return true;
+    }
+    deadline = final_deadline;
+    if (canceled && canceled()) {error = "Planning canceled"; return false;}
+    const std::string reason = postures == 0 ?
+      "no posture reaches the goal orientation at the orientation-phase distance (" + posture_error + ")" :
+      completed == 0 ? "the distance phase is blocked from every candidate posture (" + distance_error + ")" :
+      "no joint path inside the orientation-phase limits (" + path_error + ")";
+    const bool expired = std::chrono::steady_clock::now() >= final_deadline;
+    error = std::string(expired ? "Planning time budget exhausted: " : "Two-phase planning failed: ") +
+      reason + "; candidate postures " + std::to_string(postures) + ", completing the distance phase " +
+      std::to_string(completed);
+    return false;
+  }
+
+  Eigen::VectorXd randomPosture(std::mt19937 & random) const
+  {
+    Eigen::VectorXd q(q0.size());
+    for (Eigen::Index i = 0; i < q.size(); ++i) {
+      const double low = lower(i) > -OSQP_INFTY ? lower(i) : q0(i) - 3.14159;
+      const double high = upper(i) < OSQP_INFTY ? upper(i) : q0(i) + 3.14159;
+      q(i) = low < high ? std::uniform_real_distribution<double>(low, high)(random) : low;
+    }
+    return q;
+  }
+
+  // Straight joint segment inside the phase limits.
+  bool phaseSegment(const Eigen::VectorXd & a, const Eigen::VectorXd & b, std::string & error) const
+  {
+    return segmentValid(Waypoint{a, 0.0}, Waypoint{b, 0.0}, error);
+  }
+
+  // Straight line, or RRT-Connect inside the phase limits followed by shortcuts.
+  bool connectJoints(
+    const Eigen::VectorXd & from, const Eigen::VectorXd & to, std::mt19937 & random,
+    std::vector<Eigen::VectorXd> & path, std::string & error) const
+  {
+    if (phaseSegment(from, to, error)) {path = {from, to}; return true;}
+    struct Node {Eigen::VectorXd q; int parent;};
+    std::vector<Node> trees[2] = {{{from, -1}}, {{to, -1}}};
+    constexpr double step = 0.15;
+    // Returns the new node index, or -1 when the step towards the target is invalid.
+    const auto extend = [&](std::vector<Node> & tree, const Eigen::VectorXd & target) {
+        std::size_t near = 0;
+        for (std::size_t i = 1; i < tree.size(); ++i) {
+          if ((tree[i].q - target).squaredNorm() < (tree[near].q - target).squaredNorm()) {near = i;}
+        }
+        const Eigen::VectorXd delta = target - tree[near].q;
+        const double largest = delta.cwiseAbs().maxCoeff();
+        if (largest < 1.0e-9) {return static_cast<int>(near);}
+        const Eigen::VectorXd next = tree[near].q + delta * std::min(1.0, step / largest);
+        std::string ignored;
+        if (!phaseSegment(tree[near].q, next, ignored)) {return -1;}
+        tree.push_back({next, static_cast<int>(near)});
+        return static_cast<int>(tree.size() - 1);
+      };
+    for (int iteration = 0; iteration < 3000; ++iteration) {
+      if (stopped(error)) {return false;}
+      const int active = iteration % 2;
+      const int added = extend(trees[active], randomPosture(random));
+      if (added < 0) {continue;}
+      const Eigen::VectorXd target = trees[active][static_cast<std::size_t>(added)].q;
+      int reached = extend(trees[1 - active], target);
+      while (reached >= 0 &&
+        (trees[1 - active][static_cast<std::size_t>(reached)].q - target).cwiseAbs().maxCoeff() > 1.0e-9)
+      {
+        if (stopped(error)) {return false;}
+        reached = extend(trees[1 - active], target);
+      }
+      if (reached < 0) {continue;}
+      const auto branch = [](const std::vector<Node> & tree, int index) {
+          std::vector<Eigen::VectorXd> out;
+          for (; index >= 0; index = tree[static_cast<std::size_t>(index)].parent) {
+            out.push_back(tree[static_cast<std::size_t>(index)].q);
+          }
+          return out;
+        };
+      path = branch(trees[0], active == 0 ? added : reached);
+      std::reverse(path.begin(), path.end());
+      const auto tail = branch(trees[1], active == 1 ? added : reached);
+      path.insert(path.end(), tail.begin() + 1, tail.end());
+      for (int i = 0; i < 200 && path.size() > 2; ++i) {
+        if (stopped(error)) {return false;}
+        std::uniform_int_distribution<std::size_t> pick(0, path.size() - 1);
+        std::size_t first = pick(random), last = pick(random);
+        if (first > last) {std::swap(first, last);}
+        std::string ignored;
+        if (last - first < 2 || !phaseSegment(path[first], path[last], ignored)) {continue;}
+        path.erase(path.begin() + static_cast<std::ptrdiff_t>(first + 1),
+          path.begin() + static_cast<std::ptrdiff_t>(last));
+      }
+      return true;
+    }
+    error = "joint path search exhausted";
+    return false;
+  }
+
+  // Densifies the joint path; its progress is the travelled share of the first phase.
+  bool phaseWaypoints(
+    const std::vector<Eigen::VectorXd> & path, std::vector<Waypoint> & points, std::string & error) const
+  {
+    std::vector<Eigen::VectorXd> dense{path.front()};
+    for (std::size_t i = 1; i < path.size(); ++i) {
+      const int pieces = std::max(1, static_cast<int>(std::ceil(
+        (path[i] - path[i - 1]).cwiseAbs().maxCoeff() / options.angular_step)));
+      if (dense.size() + static_cast<std::size_t>(pieces) >= static_cast<std::size_t>(options.max_waypoints)) {
+        error = "Maximum trajectory waypoint count reached"; return false;
+      }
+      for (int k = 1; k <= pieces; ++k) {
+        dense.push_back(path[i - 1] + (path[i] - path[i - 1]) * k / pieces);
+      }
+    }
+    std::vector<double> travelled{0.0};
+    for (std::size_t i = 1; i < dense.size(); ++i) {
+      travelled.push_back(travelled.back() + std::max(1.0e-9, (dense[i] - dense[i - 1]).norm()));
+    }
+    points = {{dense.front(), 0.0}};
+    for (std::size_t i = 1; i < dense.size(); ++i) {
+      points.push_back({dense[i], i + 1 == dense.size() ?
+        facing_stage : facing_stage * travelled[i] / travelled.back()});
+    }
+    return true;
+  }
+
+  // The facing reference actually followed in the joint-space phase, by forward kinematics
+  // along the timed curve with the executor's progress (linear in time per segment),
+  // followed by the distance-phase knots.
+  std::vector<facing::Knot> derivedFacingPath(const PlannedTrajectory & plan) const
+  {
+    const auto & msg = plan.joint_trajectory;
+    std::vector<facing::Knot> out;
+    constexpr int samples = 4;
+    trajectory_msgs::msg::JointTrajectoryPoint sample;
+    const auto measured = [&](const trajectory_msgs::msg::JointTrajectoryPoint & point) {
+        auto state = start;
+        for (std::size_t j = 0; j < msg.joint_names.size(); ++j) {
+          state.setVariablePosition(msg.joint_names[j], point.positions[j]);
+        }
+        state.update();
+        const Eigen::Isometry3d left = state.getGlobalLinkTransform(arm_a_tip);
+        const Eigen::Isometry3d right = state.getGlobalLinkTransform(arm_b_tip);
+        static const Eigen::MatrixXd empty;
+        const auto rows = facing::evaluate(left, right, empty, empty, left_goal, right_goal,
+          facing_goal, options.facing_min_distance);
+        facing::Reference reference;
+        reference.left_axis = (left.rotation().transpose() * rows.direction).normalized();
+        reference.right_axis = (right.rotation().transpose() * -rows.direction).normalized();
+        reference.roll = rows.roll;
+        reference.distance = (right.translation() - left.translation()).norm();
+        return reference;
+      };
+    // The boundary posture meets the stage reference only within tolerance: spread that
+    // offset over the end of the phase so the streamed reference has no jump.
+    const auto exact = facing_path.sample(facing_stage);
+    auto boundary = exact;
+    for (std::size_t i = 0; i < msg.points.size(); ++i) {
+      if (plan.progress_values[i] >= facing_stage - 1.0e-9) {boundary = measured(msg.points[i]); break;}
+    }
+    for (std::size_t i = 1; i < msg.points.size(); ++i) {
+      const double s0 = plan.progress_values[i - 1], s1 = plan.progress_values[i];
+      if (s0 >= facing_stage - 1.0e-9) {break;}
+      const double span = seconds(msg.points[i].time_from_start) - seconds(msg.points[i - 1].time_from_start);
+      for (int k = 0; k < samples; ++k) {
+        const double u = static_cast<double>(k) / samples;
+        const double s = s0 + u * (s1 - s0);
+        if (!out.empty() && s <= out.back().progress + 1.0e-9) {continue;}
+        interpolateSegment(msg.points[i - 1], msg.points[i], u, span, sample);
+        auto reference = measured(sample);
+        const double w = std::clamp((s / facing_stage - 0.8) / 0.2, 0.0, 1.0);
+        reference.left_axis = (reference.left_axis + w * (exact.left_axis - boundary.left_axis)).normalized();
+        reference.right_axis = (reference.right_axis + w * (exact.right_axis - boundary.right_axis)).normalized();
+        reference.roll = facing::wrapAngle(reference.roll + w * facing::wrapAngle(exact.roll - boundary.roll));
+        reference.distance += w * (exact.distance - boundary.distance);
+        out.push_back({s, reference});
+      }
+    }
+    for (const auto & knot : facing_path.knots()) {
+      if (knot.progress >= facing_stage - 1.0e-9) {out.push_back(knot);}
+    }
+    return out;
   }
 
   void smooth(std::vector<Waypoint> & points, std::string & error) const
@@ -1124,6 +1418,10 @@ public:
   facing::Reference facing_start, facing_goal;
   facing::Path facing_path;
   double facing_stage = 0.0;
+  bool joint_phase = false;
+  double phase_min_distance = 0.0, phase_max_distance = 0.0;
+  double phase_left_angle = 0.0, phase_right_angle = 0.0;
+  double phase_roll_center = 0.0, phase_roll_half = 0.0;
   std::string reference_frame;
   Eigen::Isometry3d model_from_reference = Eigen::Isometry3d::Identity();
 
@@ -1132,7 +1430,11 @@ private:
   {
     if (!q.allFinite()) {return before;}
     const auto current = evaluate(q);
-    if (!single_arm) {return projectedFacingProgress(current, before, after);}
+    if (!single_arm) {
+      // The whole joint-space phase has the same limits; keep its progress below the stage.
+      if (joint_phase && before < facing_stage - 1.0e-9 && after <= facing_stage + 1.0e-9) {return before;}
+      return projectedFacingProgress(current, before, after);
+    }
     const Eigen::Vector3d translation = goal.relative_target.translation() - relative0.translation();
     double progress = 0.5 * (before + after);
     if (translation.squaredNorm() > 1.0e-24) {
@@ -1257,6 +1559,15 @@ bool validOptions(
     if (!finite_positive(options.facing_min_distance) || !std::isfinite(request.distance) ||
       request.distance < options.facing_min_distance)
     {error = "Facing distance must be finite and at least the minimum distance"; return false;}
+    if (!std::isfinite(request.orientation_phase_distance) || (request.orientation_phase_distance >= 0.0 &&
+      request.orientation_phase_distance < options.facing_min_distance))
+    {error = "Orientation-phase distance must be negative or at least the minimum distance"; return false;}
+    for (const double value : {options.facing_phase_distance_margin, options.facing_phase_max_distance,
+      options.facing_phase_pointing_margin, options.facing_phase_roll_margin})
+    {
+      if (!std::isfinite(value) || value < 0.0)
+      {error = "Orientation-phase limits must be finite and non-negative"; return false;}
+    }
     for (const double value : {request.pointing_tolerance, request.roll_tolerance,
       request.distance_tolerance})
     {
@@ -1391,15 +1702,19 @@ bool planCartesian(
     double required = std::max(distance / goal.cartesian_step, angle / options.angular_step);
     if (!single_arm && context.facing_stage > 0.0) {
       // Each stage keeps the nominal resolution over its own share of the progress.
-      required = std::max(angle / options.angular_step / context.facing_stage,
-        distance / goal.cartesian_step / (1.0 - context.facing_stage));
+      const double middle = context.phaseDistance();
+      required = std::max({angle / options.angular_step / context.facing_stage,
+        std::abs(middle - context.facing_start.distance) / goal.cartesian_step / context.facing_stage,
+        std::abs(context.facing_goal.distance - middle) / goal.cartesian_step / (1.0 - context.facing_stage)});
     }
+    if (context.joint_phase) {required = 1.0;}
     if (!std::isfinite(required) || required > options.max_waypoints - 1) {
       message = "Requested Cartesian resolution exceeds the maximum waypoint count"; return false;
     }
     const int count = std::max(1, static_cast<int>(std::ceil(required)));
     std::vector<Waypoint> waypoints{{context.q0, 0.0}};
-    for (int i = 1; i <= count; ++i) {
+    if (context.joint_phase && !context.planTwoPhases(waypoints, message)) {return false;}
+    for (int i = 1; !context.joint_phase && i <= count; ++i) {
       const double s = static_cast<double>(i) / count;
       if (progress) {progress(0.1 + 0.65 * s, single_arm ? "solving_constrained_cartesian_ik" : "solving_constrained_bimanual_ik");}
       if (!context.appendSegment(waypoints, s, 0, message)) {
@@ -1433,7 +1748,8 @@ bool planCartesian(
       completed.facing_start = context.facing_start;
       completed.facing_target = context.facing_goal;
       // The exact reference of the plan, as a function of progress.
-      completed.facing_path = context.facing_path.knots();
+      completed.facing_path = context.joint_phase ?
+        context.derivedFacingPath(completed) : context.facing_path.knots();
     }
     output = std::move(completed);
     message = single_arm ? "Valid single-arm Cartesian joint trajectory planned" :
@@ -1517,6 +1833,7 @@ bool validateCartesian(
       context.facing_start = plan.facing_start;
       context.facing_goal = plan.facing_target;
       context.buildFacingPath();
+      if (!context.preparePhase(message)) {return false;}
     }
     // Keep the original nominal path while checking FK/collisions with the live
     // non-commanded joints and the current transform of the reference frame.

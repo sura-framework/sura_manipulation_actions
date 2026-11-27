@@ -51,6 +51,8 @@ struct FacingGoal
   // NaN keeps the measured roll.
   double roll = std::numeric_limits<double>::quiet_NaN();
   double distance = 0.0;
+  // Distance at the end of the orientation phase; negative keeps the measured one.
+  double orientation_phase_distance = -1.0;
   double pointing_tolerance = 0.0;
   double roll_tolerance = 0.0;
   double distance_tolerance = 0.0;
@@ -112,6 +114,16 @@ struct Options
   // Facing: progress fraction used to reach the pointing axes and the roll before the
   // distance changes; 0 changes everything simultaneously.
   double facing_orientation_fraction = 0.4;
+  // true plans the orientation phase in joint space inside the limits below instead of
+  // following a facing reference. The distance phase always follows it within tolerance.
+  bool facing_joint_phase = false;
+  // Joint-space phase limits, which protect whatever links both tools. The distance stays
+  // within the margin of [start, phase target] and, if positive, below the maximum; each
+  // pointing angle and the roll stay within the margin of their start-to-goal range.
+  double facing_phase_distance_margin = 0.05;
+  double facing_phase_max_distance = 0.0;
+  double facing_phase_pointing_margin = 0.35;
+  double facing_phase_roll_margin = 0.35;
   double position_epsilon = 1.0e-6;
   double orientation_epsilon = 1.0e-6;
   bool optimize_trajectory = true;

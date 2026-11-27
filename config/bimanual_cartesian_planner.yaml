@@ -78,6 +78,15 @@
     planning.facing_min_distance: 0.02
     # Progress share used to reach pointing and roll before the distance changes; 0 = simultaneous.
     planning.facing_orientation_fraction: 0.4
+    # Point-by-point planner: plan the orientation phase in joint space inside these limits.
+    planning.facing_joint_orientation_phase: true
+    # Distance stays within this margin [m] of [start, orientation-phase distance].
+    planning.facing_phase_distance_margin: 0.05
+    # Absolute maximum tool distance [m] in that phase, e.g. the usable link length; 0 = none.
+    planning.facing_phase_max_distance: 0.0
+    # Extra angle [rad] beyond the start-to-goal range of each pointing axis and of the roll.
+    planning.facing_phase_pointing_margin: 0.35
+    planning.facing_phase_roll_margin: 0.35
     # STPIK tolerances per row: left pointing (2), right pointing (2), roll, distance.
     execution.facing_path_tolerance: [0.1, 0.1, 0.1, 0.1, 0.15, 0.02]
     execution.facing_goal_tolerance: [0.05, 0.05, 0.05, 0.05, 0.1, 0.01]

@@ -431,6 +431,70 @@ TEST(BimanualFacingPlanner, ReferenceStartsAtMeasuredGeometryAndReachesTheGoal)
     goal, options, plan, error)) << error;
 }
 
+TEST(BimanualFacingPlanner, JointSpaceOrientationPhaseReachesItsDistanceThenFollowsTheFinalOne)
+{
+  SyntheticRobot robot(6, 6);
+  auto start = robot.scene->getCurrentState();
+  start.setVariablePosition(robot.left.joint_names[3], 0.15);
+  start.setVariablePosition(robot.right.joint_names[4], -0.1);
+  start.update();
+  const double initial = (start.getGlobalLinkTransform(robot.right.tip_frame).translation() -
+    start.getGlobalLinkTransform(robot.left.tip_frame).translation()).norm();
+  auto goal = robot.goal(0.0);
+  goal.facing.orientation_phase_distance = initial + 0.04;
+  goal.facing.distance = initial - 0.03;
+  goal.planning_time = 20.0;
+  auto options = robot.options();
+  options.facing_joint_phase = true;
+  BimanualCartesianPlanner planner;
+  PlannedTrajectory plan;
+  std::string error;
+  ASSERT_TRUE(planner.plan(robot.scene, start, robot.left, robot.right, robot.pair,
+    goal, options, plan, error)) << error;
+  facing::Path path;
+  ASSERT_TRUE(path.init(plan.facing_path, error)) << error;
+  EXPECT_NEAR(path.sample(0.4).distance, initial + 0.04, 1e-6);
+  EXPECT_NEAR(path.sample(1.0).distance, initial - 0.03, 1e-6);
+  EXPECT_NE(std::find(plan.progress_values.begin(), plan.progress_values.end(), 0.4), plan.progress_values.end());
+  // The derived reference follows the motion in both phases, within the goal tolerances.
+  for (std::size_t i = 0; i < plan.progress_values.size(); ++i) {
+    const auto & state = plan.trajectory->getWayPoint(i);
+    const auto rows = facing::evaluate(state.getGlobalLinkTransform(robot.left.tip_frame),
+      state.getGlobalLinkTransform(robot.right.tip_frame), {}, {}, plan.facing_left_goal,
+      plan.facing_right_goal, path.sample(plan.progress_values[i]), options.facing_min_distance);
+    EXPECT_LE(rows.left_angle, goal.facing.pointing_tolerance + 2e-3) << i;
+    EXPECT_LE(rows.right_angle, goal.facing.pointing_tolerance + 2e-3) << i;
+    EXPECT_LE(std::abs(rows.error(5)), goal.facing.distance_tolerance + 1e-3) << i;
+    const double distance = path.sample(plan.progress_values[i]).distance - rows.error(5);
+    if (plan.progress_values[i] < 0.4) {
+      EXPECT_GE(distance, initial - options.facing_phase_distance_margin - 1e-6) << i;
+      EXPECT_LE(distance, initial + 0.04 + options.facing_phase_distance_margin + 1e-6) << i;
+    }
+  }
+  ASSERT_TRUE(planner.validatePlan(robot.scene, robot.left, robot.right, robot.pair,
+    goal, options, plan, error)) << error;
+  // A maximum tool distance below the requested phase distance is rejected.
+  options.facing_phase_max_distance = initial + 0.01;
+  EXPECT_FALSE(planner.plan(robot.scene, start, robot.left, robot.right, robot.pair,
+    goal, options, plan, error));
+  EXPECT_NE(error.find("facing_phase_max_distance"), std::string::npos) << error;
+}
+
+TEST(BimanualFacingGeometry, StagedKnotsReachTheRequestedStageDistance)
+{
+  facing::Reference from, to;
+  from.distance = 0.4;
+  to = from;
+  to.distance = 0.3;
+  double used = -1.0;
+  facing::Path path;
+  std::string error;
+  ASSERT_TRUE(path.init(facing::stagedKnots(from, to, 0.4, &used, 0.05, 0.002, 8, 0.5), error)) << error;
+  EXPECT_DOUBLE_EQ(used, 0.4);
+  EXPECT_NEAR(path.sample(0.4).distance, 0.5, 1e-12);
+  EXPECT_NEAR(path.sample(1.0).distance, 0.3, 1e-12);
+}
+
 TEST(BimanualFacingGeometry, StagedKnotsOrientBeforeChangingTheDistance)
 {
   facing::Reference from, to;
